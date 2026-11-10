@@ -1,5 +1,5 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *Lost Front: Aimbot (Priority 199), R15/R6 Joint Skeleton, Box, FPV ESP, TeamCheck, NoRecoil, NoSpread*
+-- *Lost Front: Long-Range Prediction Aimbot, Chams (Enemies/Hands/Weapon), Bullet Tracer, NoRecoil/NoSpread, ESP*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,7 +12,7 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
--- Полная очистка предыдущего запуска (UI, бинды, хуки, Drawing)
+-- Полная очистка предыдущего запуска
 if _G.OcelHubCleanup then
     pcall(_G.OcelHubCleanup)
 end
@@ -51,6 +51,16 @@ pcall(function()
     GameModules.Items      = safeImport("IIIlllIIIIIIlllllIlllIlIIlIIIlllIIIllIIlIlIIIlIlllllIIlllllI")
 end)
 
+local ChamStyleList = {
+    "Water Flow",
+    "Glossy Flow",
+    "Wireframe",
+    "Neon Glow",
+    "Ghost Glass",
+    "RGB Flow",
+    "Monochrome",
+}
+
 local Config = {
     MenuOpen = true,
     -- ESP
@@ -61,14 +71,23 @@ local Config = {
     TeamCheck = true,
     -- Aimbot & Combat
     Aimbot = false,
+    Prediction = true,
     VisibleCheck = true,
     LineToTarget = true,
     ShowFOV = true,
     NoRecoil = false,
     NoSpread = false,
+    BulletTracer = true,
     TargetPart = "Head", -- "Head" | "UpperTorso"
     AimFOV = 120,
     AimSpeed = 0.85,
+    -- Chams
+    EnemyChams = false,
+    EnemyChamStyle = "Water Flow",
+    HandsChams = true,
+    HandsChamStyle = "Water Flow",
+    WeaponChams = true,
+    WeaponChamStyle = "Glossy Flow",
 }
 
 local Palette = {
@@ -82,9 +101,87 @@ local Palette = {
 }
 
 local Connections = {}
+local ActiveBallistics = {
+    Speed = 2500,
+    Gravity = workspace.Gravity / 8,
+}
 
 -- =========================================================================
--- No Recoil & No Spread (патч таблиц + хук модулей)
+-- Bullet Tracer (3D Beam от FirePoint к точке попадания)
+-- =========================================================================
+local tracerRayParams = RaycastParams.new()
+tracerRayParams.FilterType = Enum.RaycastFilterType.Exclude
+tracerRayParams.IgnoreWater = true
+
+local function spawnBulletTracer(weapon)
+    if not Config.BulletTracer or not Camera then return end
+    local terrain = workspace:FindFirstChildOfClass("Terrain") or workspace
+
+    local origin = nil
+    if type(weapon) == "table" and typeof(weapon.instance) == "Instance" then
+        local fp = weapon.instance:FindFirstChild("FirePoint", true)
+        if fp then
+            origin = fp:IsA("Attachment") and fp.WorldPosition or (fp:IsA("BasePart") and fp.Position or nil)
+        end
+    end
+    if not origin then
+        origin = (Camera.CFrame * CFrame.new(0.35, -0.25, -1.2)).Position
+    end
+
+    local ignoreList = {}
+    if LocalPlayer.Character then table.insert(ignoreList, LocalPlayer.Character) end
+    if Camera then table.insert(ignoreList, Camera) end
+    local ignoreFolder = workspace:FindFirstChild("ignore")
+    if ignoreFolder then table.insert(ignoreList, ignoreFolder) end
+
+    tracerRayParams.FilterDescendantsInstances = ignoreList
+    local camPos = Camera.CFrame.Position
+    local dir = Camera.CFrame.LookVector * 1200
+    local result = workspace:Raycast(camPos, dir, tracerRayParams)
+    local hitPos = result and result.Position or (camPos + dir)
+
+    local a0 = Instance.new("Attachment")
+    a0.WorldPosition = origin
+    a0.Parent = terrain
+
+    local a1 = Instance.new("Attachment")
+    a1.WorldPosition = hitPos
+    a1.Parent = terrain
+
+    local beam = Instance.new("Beam")
+    beam.Attachment0 = a0
+    beam.Attachment1 = a1
+    beam.FaceCamera = true
+    beam.LightEmission = 1
+    beam.LightInfluence = 0
+    beam.Width0 = 0.08
+    beam.Width1 = 0.03
+    beam.Segments = 1
+    beam.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(110, 215, 255)),
+    })
+    beam.Transparency = NumberSequence.new(0.05)
+    beam.Parent = terrain
+
+    task.spawn(function()
+        local duration = 0.45
+        local elapsed = 0
+        while elapsed < duration and beam.Parent do
+            local dt = RunService.Heartbeat:Wait()
+            elapsed = elapsed + dt
+            local alpha = math.clamp(elapsed / duration, 0, 1)
+            beam.Transparency = NumberSequence.new(0.05 + 0.95 * alpha)
+            beam.Width0 = 0.08 * (1 - alpha * 0.5)
+        end
+        pcall(function() beam:Destroy() end)
+        pcall(function() a0:Destroy() end)
+        pcall(function() a1:Destroy() end)
+    end)
+end
+
+-- =========================================================================
+-- No Recoil & No Spread + Баллистика активного оружия
 -- =========================================================================
 local RecoilKeys = {
     recoil_magnitude = 0,
@@ -154,7 +251,16 @@ local function applyWeaponMods()
     end
 end
 
--- Сохраняем оригиналы функций модулей для чистого восстановления
+local function updateBallisticsFromStats(stats)
+    if type(stats) ~= "table" then return end
+    if type(stats.bullet_speed) == "number" and stats.bullet_speed > 0 then
+        ActiveBallistics.Speed = stats.bullet_speed
+    end
+    if typeof(stats.bullet_gravity) == "Vector3" then
+        ActiveBallistics.Gravity = math.abs(stats.bullet_gravity.Y)
+    end
+end
+
 local OrigShakeNew = GameModules.Shake and GameModules.Shake.new
 local OrigGetStats = GameModules.Stats and GameModules.Stats.getStatsForAttachments
 local OrigProjNew  = GameModules.Projectile and GameModules.Projectile.new
@@ -170,6 +276,7 @@ if GameModules.Stats and OrigGetStats then
     GameModules.Stats.getStatsForAttachments = function(...)
         local stats, disp = OrigGetStats(...)
         if type(stats) == "table" then
+            updateBallisticsFromStats(stats)
             if Config.NoRecoil then patchStatTable(stats, RecoilKeys, true) end
             if Config.NoSpread then patchStatTable(stats, SpreadKeys, true) end
         end
@@ -179,6 +286,11 @@ end
 
 if GameModules.Projectile and OrigProjNew then
     GameModules.Projectile.new = function(weapon, ...)
+        if type(weapon) == "table" then
+            updateBallisticsFromStats(weapon.stats)
+        end
+        spawnBulletTracer(weapon)
+
         if Config.NoSpread and type(weapon) == "table" then
             if type(weapon.stats) == "table" then
                 patchStatTable(weapon.stats, SpreadKeys, true)
@@ -190,6 +302,171 @@ if GameModules.Projectile and OrigProjNew then
             if ok then return res end
         end
         return OrigProjNew(weapon, ...)
+    end
+end
+
+-- =========================================================================
+-- Система Chams (Враги, Руки, Оружие + 7 стилей)
+-- =========================================================================
+local OrigPartProps = {} -- [BasePart] = { Material, Color, Transparency, Reflectance, TextureID }
+local OrigSurfaceApp = {} -- [SurfaceAppearance] = originalParent
+local TrackedChamParts = {
+    Enemy = {},
+    Hands = {},
+    Weapon = {},
+}
+local EnemyHighlights = {} -- [Model] = Highlight
+
+local function saveAndDisableSurfaceAppearances(part)
+    for _, child in ipairs(part:GetChildren()) do
+        if child:IsA("SurfaceAppearance") and not OrigSurfaceApp[child] then
+            OrigSurfaceApp[child] = part
+            child.Parent = nil
+        end
+    end
+end
+
+local function restorePartProps(part)
+    local orig = OrigPartProps[part]
+    if not orig then return end
+    pcall(function()
+        part.Material = orig.Material
+        part.Color = orig.Color
+        part.Transparency = orig.Transparency
+        part.Reflectance = orig.Reflectance
+        if orig.TextureID ~= nil and part:IsA("MeshPart") then
+            part.TextureID = orig.TextureID
+        end
+    end)
+    OrigPartProps[part] = nil
+end
+
+local function restoreSurfaceAppearancesFor(model)
+    for sa, origParent in pairs(OrigSurfaceApp) do
+        if origParent and origParent.Parent and (not model or origParent:IsDescendantOf(model)) then
+            pcall(function() sa.Parent = origParent end)
+            OrigSurfaceApp[sa] = nil
+        elseif not origParent or not origParent.Parent then
+            OrigSurfaceApp[sa] = nil
+        end
+    end
+end
+
+local function clearChamGroup(groupName)
+    for part in pairs(TrackedChamParts[groupName]) do
+        restorePartProps(part)
+        TrackedChamParts[groupName][part] = nil
+    end
+    if groupName == "Enemy" then
+        for char, hl in pairs(EnemyHighlights) do
+            pcall(function() hl:Destroy() end)
+            EnemyHighlights[char] = nil
+        end
+    end
+end
+
+local function getStyleProps(style, t, phase)
+    local s = 0.5 + 0.5 * math.sin(t * 2.8 + (phase or 0))
+    if style == "Water Flow" then
+        local col = Color3.fromRGB(35, 145, 255):Lerp(Color3.fromRGB(165, 240, 255), s)
+        return Enum.Material.ForceField, col, 0.22, 0.2, ""
+    elseif style == "Glossy Flow" then
+        local col = Color3.fromRGB(200, 220, 255):Lerp(Color3.fromRGB(255, 255, 255), s)
+        return Enum.Material.Glass, col, 0.12, 0.85, nil
+    elseif style == "Wireframe" then
+        return Enum.Material.ForceField, Color3.fromRGB(235, 245, 255), 0.62, 0, "rbxassetid://446111271"
+    elseif style == "Neon Glow" then
+        return Enum.Material.Neon, Color3.fromRGB(245, 245, 255), 0.18, 0, ""
+    elseif style == "Ghost Glass" then
+        return Enum.Material.Glass, Color3.fromRGB(210, 225, 245), 0.52, 0.45, nil
+    elseif style == "RGB Flow" then
+        local col = Color3.fromHSV((t * 0.28 + (phase or 0) * 0.05) % 1, 0.78, 1)
+        return Enum.Material.ForceField, col, 0.2, 0.1, ""
+    else -- "Monochrome"
+        local col = Color3.fromRGB(145, 145, 145):Lerp(Color3.fromRGB(255, 255, 255), s)
+        return Enum.Material.ForceField, col, 0.18, 0.25, ""
+    end
+end
+
+local function applyChamToPart(part, groupName, style, t, phase)
+    if not part:IsA("BasePart") then return end
+    if not OrigPartProps[part] then
+        if part.Transparency >= 0.95 then return end
+        OrigPartProps[part] = {
+            Material = part.Material,
+            Color = part.Color,
+            Transparency = part.Transparency,
+            Reflectance = part.Reflectance,
+            TextureID = part:IsA("MeshPart") and part.TextureID or nil,
+        }
+    end
+    saveAndDisableSurfaceAppearances(part)
+    TrackedChamParts[groupName][part] = true
+
+    local mat, col, trans, refl, tex = getStyleProps(style, t, phase)
+    part.Material = mat
+    part.Color = col
+    part.Transparency = trans
+    part.Reflectance = refl
+    if part:IsA("MeshPart") and tex ~= nil then
+        part.TextureID = tex
+    end
+end
+
+local function updateAllChams(t)
+    -- 1. ViewModel: Руки и Оружие
+    local vm = Camera and Camera:FindFirstChild("ViewModel")
+    local weaponContainer = vm and vm:FindFirstChild("Model")
+
+    if vm and (Config.HandsChams or Config.WeaponChams) then
+        local idx = 0
+        for _, desc in ipairs(vm:GetDescendants()) do
+            if desc:IsA("BasePart") then
+                idx = idx + 1
+                local isWeapon = weaponContainer and desc:IsDescendantOf(weaponContainer)
+                if isWeapon then
+                    if Config.WeaponChams then
+                        applyChamToPart(desc, "Weapon", Config.WeaponChamStyle, t, idx * 0.15)
+                    elseif TrackedChamParts.Weapon[desc] then
+                        restorePartProps(desc)
+                        TrackedChamParts.Weapon[desc] = nil
+                    end
+                elseif desc.Name ~= "HRP" then
+                    if Config.HandsChams then
+                        applyChamToPart(desc, "Hands", Config.HandsChamStyle, t, idx * 0.2)
+                    elseif TrackedChamParts.Hands[desc] then
+                        restorePartProps(desc)
+                        TrackedChamParts.Hands[desc] = nil
+                    end
+                end
+            end
+        end
+    end
+
+    if not Config.HandsChams then clearChamGroup("Hands") end
+    if not Config.WeaponChams then clearChamGroup("Weapon") end
+
+    -- Очистка мертвых ссылок ViewModel
+    for part in pairs(TrackedChamParts.Hands) do
+        if not part.Parent or (vm and not part:IsDescendantOf(vm)) then
+            restorePartProps(part)
+            TrackedChamParts.Hands[part] = nil
+        end
+    end
+    for part in pairs(TrackedChamParts.Weapon) do
+        if not part.Parent or (weaponContainer and not part:IsDescendantOf(weaponContainer)) then
+            restorePartProps(part)
+            TrackedChamParts.Weapon[part] = nil
+        end
+    end
+    if not Config.HandsChams and not Config.WeaponChams and vm then
+        restoreSurfaceAppearancesFor(vm)
+    end
+
+    -- 2. Враги (Enemy Chams + Highlight AlwaysOnTop)
+    if not Config.EnemyChams then
+        clearChamGroup("Enemy")
+        restoreSurfaceAppearancesFor(nil)
     end
 end
 
@@ -586,7 +863,7 @@ local TargetLineOutline = newLine(3, Palette.Black, 3)
 local TargetLine = newLine(1.4, Palette.White, 4)
 
 -- =========================================================================
--- Ocel-hub UI
+-- Ocel-hub UI (3 таба: AIM | ESP | CHAMS)
 -- =========================================================================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "OcelHub_UI"
@@ -648,8 +925,8 @@ makeDraggable(TogglePill, TogglePill)
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.fromOffset(252, 336)
-MainFrame.Position = UDim2.new(0.5, -126, 0.5, -168)
+MainFrame.Size = UDim2.fromOffset(258, 342)
+MainFrame.Position = UDim2.new(0.5, -129, 0.5, -171)
 MainFrame.BackgroundColor3 = Palette.Bg
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
@@ -714,7 +991,7 @@ Instance.new("UICorner", TabBar).CornerRadius = UDim.new(0, 7)
 
 local function makeTabBtn(text, xScale)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0.5, -4, 1, -4)
+    btn.Size = UDim2.new(1 / 3, -3, 1, -4)
     btn.Position = UDim2.new(xScale, 2, 0, 2)
     btn.BackgroundColor3 = Palette.White
     btn.Text = text
@@ -727,8 +1004,9 @@ local function makeTabBtn(text, xScale)
     return btn
 end
 
-local TabESPBtn = makeTabBtn("VISUAL", 0)
-local TabAIMBtn = makeTabBtn("AIMBOT", 0.5)
+local TabAIMBtn   = makeTabBtn("AIM", 0)
+local TabESPBtn   = makeTabBtn("ESP", 1 / 3)
+local TabCHAMSBtn = makeTabBtn("CHAMS", 2 / 3)
 
 local function createContainer()
     local frame = Instance.new("ScrollingFrame")
@@ -749,23 +1027,28 @@ local function createContainer()
     return frame
 end
 
-local PageESP = createContainer()
-local PageAIM = createContainer()
+local PageAIM   = createContainer()
+local PageESP   = createContainer()
+local PageCHAMS = createContainer()
+
+local TabMap = {
+    AIM   = { btn = TabAIMBtn,   page = PageAIM },
+    ESP   = { btn = TabESPBtn,   page = PageESP },
+    CHAMS = { btn = TabCHAMSBtn, page = PageCHAMS },
+}
 
 local function setActiveTab(tabName)
-    local isESP = (tabName == "ESP")
-    PageESP.Visible = isESP
-    PageAIM.Visible = not isESP
-
-    TabESPBtn.BackgroundTransparency = isESP and 0 or 1
-    TabESPBtn.TextColor3 = isESP and Palette.Black or Palette.Muted
-
-    TabAIMBtn.BackgroundTransparency = isESP and 1 or 0
-    TabAIMBtn.TextColor3 = isESP and Palette.Muted or Palette.Black
+    for name, entry in pairs(TabMap) do
+        local active = (name == tabName)
+        entry.page.Visible = active
+        entry.btn.BackgroundTransparency = active and 0 or 1
+        entry.btn.TextColor3 = active and Palette.Black or Palette.Muted
+    end
 end
 
-TabESPBtn.MouseButton1Click:Connect(function() setActiveTab("ESP") end)
 TabAIMBtn.MouseButton1Click:Connect(function() setActiveTab("AIM") end)
+TabESPBtn.MouseButton1Click:Connect(function() setActiveTab("ESP") end)
+TabCHAMSBtn.MouseButton1Click:Connect(function() setActiveTab("CHAMS") end)
 setActiveTab("ESP")
 
 local function addToggle(parent, labelText, configKey, onChanged)
@@ -844,7 +1127,7 @@ local function addCycle(parent, labelText, configKey, options)
     stroke.Thickness = 1
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(0.55, 0, 1, 0)
+    lbl.Size = UDim2.new(0.48, 0, 1, 0)
     lbl.Position = UDim2.new(0, 12, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = labelText
@@ -855,8 +1138,8 @@ local function addCycle(parent, labelText, configKey, options)
     lbl.Parent = btn
 
     local val = Instance.new("TextLabel")
-    val.Size = UDim2.new(0.45, -14, 1, 0)
-    val.Position = UDim2.new(0.55, 0, 0, 0)
+    val.Size = UDim2.new(0.52, -14, 1, 0)
+    val.Position = UDim2.new(0.48, 0, 0, 0)
     val.BackgroundTransparency = 1
     val.Text = Config[configKey]
     val.TextColor3 = Palette.Muted
@@ -964,21 +1247,30 @@ local function addSlider(parent, labelText, configKey, minVal, maxVal, decimals)
     updateFromRatio((Config[configKey] - minVal) / (maxVal - minVal))
 end
 
+addToggle(PageAIM, "Aimbot", "Aimbot")
+addToggle(PageAIM, "Prediction (Long)", "Prediction")
+addToggle(PageAIM, "Visible Check", "VisibleCheck")
+addToggle(PageAIM, "Line to Target", "LineToTarget")
+addToggle(PageAIM, "Show FOV", "ShowFOV")
+addToggle(PageAIM, "No Recoil", "NoRecoil", applyWeaponMods)
+addToggle(PageAIM, "No Spread", "NoSpread", applyWeaponMods)
+addToggle(PageAIM, "Bullet Tracer", "BulletTracer")
+addCycle(PageAIM, "Target Part", "TargetPart", { "Head", "UpperTorso" })
+addSlider(PageAIM, "Aim FOV", "AimFOV", 30, 300, 0)
+addSlider(PageAIM, "Aim Speed", "AimSpeed", 0.15, 1.00, 2)
+
 addToggle(PageESP, "Boxes", "BoxESP")
 addToggle(PageESP, "Skeleton", "SkeletonESP")
 addToggle(PageESP, "FPV Drones", "FPVESP")
 addToggle(PageESP, "Visible Highlight", "ESPVisibleColor")
 addToggle(PageESP, "Team Check", "TeamCheck")
 
-addToggle(PageAIM, "Aimbot", "Aimbot")
-addToggle(PageAIM, "Visible Check", "VisibleCheck")
-addToggle(PageAIM, "Line to Target", "LineToTarget")
-addToggle(PageAIM, "Show FOV", "ShowFOV")
-addToggle(PageAIM, "No Recoil", "NoRecoil", applyWeaponMods)
-addToggle(PageAIM, "No Spread", "NoSpread", applyWeaponMods)
-addCycle(PageAIM, "Target Part", "TargetPart", { "Head", "UpperTorso" })
-addSlider(PageAIM, "Aim FOV", "AimFOV", 30, 300, 0)
-addSlider(PageAIM, "Aim Speed", "AimSpeed", 0.15, 1.00, 2)
+addToggle(PageCHAMS, "Enemy Chams", "EnemyChams")
+addCycle(PageCHAMS, "Enemy Style", "EnemyChamStyle", ChamStyleList)
+addToggle(PageCHAMS, "Hands Chams", "HandsChams")
+addCycle(PageCHAMS, "Hands Style", "HandsChamStyle", ChamStyleList)
+addToggle(PageCHAMS, "Weapon Chams", "WeaponChams")
+addCycle(PageCHAMS, "Weapon Style", "WeaponChamStyle", ChamStyleList)
 
 local function setMenuVisible(state)
     Config.MenuOpen = state
@@ -1000,11 +1292,12 @@ table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gp
 end))
 
 -- =========================================================================
--- Поиск цели и наводка (до cameraRenderUpdate и camShake)
+-- Поиск цели с баллистическим упреждением для дальних дистанций
 -- =========================================================================
 local function findBestTarget(screenCenter)
     local bestPart = nil
-    local bestDist = Config.AimFOV
+    local bestRoot = nil
+    local bestScreenDist = Config.AimFOV
 
     for player in pairs(ESPCache) do
         local char = player.Character
@@ -1019,16 +1312,35 @@ local function findBestTarget(screenCenter)
                 local pos, onScreen = Camera:WorldToViewportPoint(aimPart.Position)
                 if onScreen and pos.Z > 0 then
                     local dist = (Vector2.new(pos.X, pos.Y) - screenCenter).Magnitude
-                    if dist < bestDist and (not Config.VisibleCheck or isVisible(char, aimPart)) then
-                        bestDist = dist
+                    if dist < bestScreenDist and (not Config.VisibleCheck or isVisible(char, aimPart)) then
+                        bestScreenDist = dist
                         bestPart = aimPart
+                        bestRoot = root
                     end
                 end
             end
         end
     end
 
-    return bestPart
+    return bestPart, bestRoot, bestScreenDist
+end
+
+local function getPredictedAimPos(aimPart, rootPart)
+    local rawPos = aimPart.Position
+    if not Config.Prediction or not Camera then return rawPos end
+
+    local camPos = Camera.CFrame.Position
+    local dist = (rawPos - camPos).Magnitude
+    local speed = ActiveBallistics.Speed > 0 and ActiveBallistics.Speed or 2500
+    local grav = ActiveBallistics.Gravity or (workspace.Gravity / 8)
+    local travelTime = math.clamp(dist / speed, 0, 1.5)
+
+    local vel = (rootPart and rootPart.AssemblyLinearVelocity) or aimPart.AssemblyLinearVelocity or Vector3.zero
+    if vel.Magnitude < 0.6 then
+        vel = Vector3.zero
+    end
+
+    return rawPos + vel * travelTime + Vector3.new(0, 0.5 * grav * travelTime * travelTime, 0)
 end
 
 local currentTargetPart = nil
@@ -1040,15 +1352,18 @@ RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, 
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
 
+    local bestRoot, bestScreenDist
     if Config.Aimbot or Config.LineToTarget then
-        currentTargetPart = findBestTarget(screenCenter)
+        currentTargetPart, bestRoot, bestScreenDist = findBestTarget(screenCenter)
     else
         currentTargetPart = nil
     end
 
     if Config.Aimbot and currentTargetPart and Camera.CameraType ~= Enum.CameraType.Scriptable then
-        local targetCF = CFrame.lookAt(Camera.CFrame.Position, currentTargetPart.Position)
-        if Config.AimSpeed >= 0.98 then
+        local aimPos = getPredictedAimPos(currentTargetPart, bestRoot)
+        local targetCF = CFrame.lookAt(Camera.CFrame.Position, aimPos)
+
+        if Config.AimSpeed >= 0.98 or (bestScreenDist and bestScreenDist <= 10 and Config.AimSpeed >= 0.65) then
             Camera.CFrame = targetCF
         else
             local alpha = math.clamp(1 - (1 - Config.AimSpeed) ^ (math.max(dt, 1 / 240) * 60), 0, 1)
@@ -1058,13 +1373,15 @@ RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, 
 end)
 
 -- =========================================================================
--- Отрисовка ESP + гашение kickback
+-- Отрисовка ESP, Chams (враги/руки/оружие), FOV и Line to Target
 -- =========================================================================
 local activeFolder = ReplicatedStorage:FindFirstChild("active")
 local clientFolder = activeFolder and activeFolder:FindFirstChild("client")
 local kickbackVal  = clientFolder and clientFolder:FindFirstChild("Kickback")
 
 table.insert(Connections, RunService.RenderStepped:Connect(function()
+    local now = tick()
+
     if Config.NoRecoil then
         if not kickbackVal then
             activeFolder = ReplicatedStorage:FindFirstChild("active")
@@ -1078,6 +1395,8 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
 
     Camera = workspace.CurrentCamera
     if not Camera then return end
+
+    updateAllChams(now)
 
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
@@ -1100,6 +1419,10 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
 
         if not char or not hum or hum.Health <= 0 or not root or not isEnemy(player) then
             hidePlayerESP(data)
+            if EnemyHighlights[char] then
+                pcall(function() EnemyHighlights[char]:Destroy() end)
+                EnemyHighlights[char] = nil
+            end
             continue
         end
 
@@ -1110,6 +1433,37 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
 
         local visible = isVisible(char, aimPart)
         local drawColor = (Config.ESPVisibleColor and not visible) and Palette.Dim or Palette.White
+
+        -- Enemy Chams
+        if Config.EnemyChams then
+            local idx = 0
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                    idx = idx + 1
+                    applyChamToPart(part, "Enemy", Config.EnemyChamStyle, now, idx * 0.12)
+                end
+            end
+
+            local hl = EnemyHighlights[char]
+            if not hl or not hl.Parent then
+                hl = Instance.new("Highlight")
+                hl.Name = "OcelEnemyCham"
+                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                hl.Adornee = char
+                hl.Parent = char
+                EnemyHighlights[char] = hl
+            end
+
+            local _, styleCol = getStyleProps(Config.EnemyChamStyle, now, 0)
+            local isWire = (Config.EnemyChamStyle == "Wireframe")
+            hl.FillColor = visible and styleCol or Color3.fromRGB(160, 70, 70)
+            hl.OutlineColor = visible and Palette.White or styleCol
+            hl.FillTransparency = isWire and 0.9 or (visible and 0.65 or 0.72)
+            hl.OutlineTransparency = 0
+        elseif EnemyHighlights[char] then
+            pcall(function() EnemyHighlights[char]:Destroy() end)
+            EnemyHighlights[char] = nil
+        end
 
         if Config.BoxESP then
             local bx, by, bw, bh = computeBoxFromParts(char, bodyPartsSet)
@@ -1282,6 +1636,10 @@ _G.OcelHubCleanup = function()
     if GameModules.Shake and OrigShakeNew then GameModules.Shake.new = OrigShakeNew end
     if GameModules.Stats and OrigGetStats then GameModules.Stats.getStatsForAttachments = OrigGetStats end
     if GameModules.Projectile and OrigProjNew then GameModules.Projectile.new = OrigProjNew end
+    clearChamGroup("Enemy")
+    clearChamGroup("Hands")
+    clearChamGroup("Weapon")
+    restoreSurfaceAppearancesFor(nil)
     for _, conn in ipairs(Connections) do
         pcall(function() conn:Disconnect() end)
     end
