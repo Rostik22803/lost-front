@@ -1,5 +1,5 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *AimSpeed нормализован по dt (1.0 = мгновенный лок), добавлен ESP на FPV-дроны*
+-- *Lost Front: Aimbot (Priority 199), R15/R6 Joint Skeleton, Box, FPV ESP, TeamCheck, NoRecoil, NoSpread*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -12,7 +12,7 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
--- Полная очистка предыдущего запуска (UI, бинды, Drawing)
+-- Полная очистка предыдущего запуска (UI, бинды, хуки, Drawing)
 if _G.OcelHubCleanup then
     pcall(_G.OcelHubCleanup)
 end
@@ -24,16 +24,31 @@ pcall(function()
     if old then old:Destroy() end
 end)
 
--- Клиентский реестр команд Lost Front
-local LostFrontRegistry = nil
+-- Импорт клиентских модулей Lost Front
+local GameModules = {
+    Registry = nil,
+    Shake = nil,
+    Projectile = nil,
+    Stats = nil,
+    Items = nil,
+}
+
 pcall(function()
     local loaderMod = ReplicatedStorage:FindFirstChild("lIIIlIIllIIlllIIIlllllIIlIIIIIlllIIIlIlllIllllIlIIIllIlIIIIl")
-    if loaderMod then
-        local loader = require(loaderMod)
-        if loader and loader.import then
-            LostFrontRegistry = loader.import("llIlIIlIllIlllIlIIlIlIIlllIIIlllIlIllllIIllIlllIlllIlIllIlII")
-        end
+    if not loaderMod then return end
+    local loader = require(loaderMod)
+    if not (loader and loader.import) then return end
+
+    local function safeImport(name)
+        local ok, res = pcall(loader.import, name)
+        return ok and res or nil
     end
+
+    GameModules.Registry   = safeImport("llIlIIlIllIlllIlIIlIlIIlllIIIlllIlIllllIIllIlllIlllIlIllIlII")
+    GameModules.Shake      = safeImport("IIIllIIllllIlllllIllllIlIIIlIlIIIIIlIIIlIIlIIllIIlIIlIlIIlll")
+    GameModules.Projectile = safeImport("lIIIlllIIlIllIlllllIIllllIlllIlIlIIlIllIllllIIlIllIlllllIllI")
+    GameModules.Stats      = safeImport("IIIIIlIlllIIIlIlIIllIIIIlIllIlllllIlIllllIlIlllIIlIIlIIlIlII")
+    GameModules.Items      = safeImport("IIIlllIIIIIIlllllIlllIlIIlIIIlllIIIllIIlIlIIIlIlllllIIlllllI")
 end)
 
 local Config = {
@@ -44,11 +59,13 @@ local Config = {
     FPVESP = true,
     ESPVisibleColor = true,
     TeamCheck = true,
-    -- Aimbot
+    -- Aimbot & Combat
     Aimbot = false,
     VisibleCheck = true,
     LineToTarget = true,
     ShowFOV = true,
+    NoRecoil = false,
+    NoSpread = false,
     TargetPart = "Head", -- "Head" | "UpperTorso"
     AimFOV = 120,
     AimSpeed = 0.85,
@@ -66,6 +83,119 @@ local Palette = {
 
 local Connections = {}
 
+-- =========================================================================
+-- No Recoil & No Spread (патч таблиц + хук модулей)
+-- =========================================================================
+local RecoilKeys = {
+    recoil_magnitude = 0,
+    recoil_roughness = 0,
+    recoil_recover_low = 0,
+    recoil_recover_high = 0,
+    recoil_rotation = Vector3.zero,
+    kickback = 0,
+    aimkickback = 0,
+}
+
+local SpreadKeys = {
+    min_spread = 0,
+    max_spread = 0,
+    spread = 0,
+}
+
+local OrigStatValues = setmetatable({}, { __mode = "k" })
+
+local function patchStatTable(tbl, keyMap, enable)
+    if type(tbl) ~= "table" then return end
+    local saved = OrigStatValues[tbl]
+    for k, zeroVal in pairs(keyMap) do
+        if rawget(tbl, k) ~= nil then
+            if enable then
+                if not saved then
+                    saved = {}
+                    OrigStatValues[tbl] = saved
+                end
+                if saved[k] == nil then
+                    saved[k] = tbl[k]
+                end
+                tbl[k] = zeroVal
+            elseif saved and saved[k] ~= nil then
+                tbl[k] = saved[k]
+            end
+        end
+    end
+end
+
+local function walkAndPatchItems(root, visited, depth)
+    if type(root) ~= "table" or visited[root] or depth > 5 then return end
+    visited[root] = true
+    patchStatTable(root, RecoilKeys, Config.NoRecoil)
+    patchStatTable(root, SpreadKeys, Config.NoSpread)
+    for _, v in pairs(root) do
+        if type(v) == "table" then
+            walkAndPatchItems(v, visited, depth + 1)
+        end
+    end
+end
+
+local function applyWeaponMods()
+    if GameModules.Items and GameModules.Items.items then
+        walkAndPatchItems(GameModules.Items.items, {}, 0)
+    end
+    if getgc then
+        local ok, gc = pcall(getgc, true)
+        if ok and type(gc) == "table" then
+            for _, obj in ipairs(gc) do
+                if type(obj) == "table" and (rawget(obj, "recoil_magnitude") ~= nil or rawget(obj, "min_spread") ~= nil or rawget(obj, "head_damage") ~= nil) then
+                    patchStatTable(obj, RecoilKeys, Config.NoRecoil)
+                    patchStatTable(obj, SpreadKeys, Config.NoSpread)
+                end
+            end
+        end
+    end
+end
+
+-- Сохраняем оригиналы функций модулей для чистого восстановления
+local OrigShakeNew = GameModules.Shake and GameModules.Shake.new
+local OrigGetStats = GameModules.Stats and GameModules.Stats.getStatsForAttachments
+local OrigProjNew  = GameModules.Projectile and GameModules.Projectile.new
+
+if GameModules.Shake and OrigShakeNew then
+    GameModules.Shake.new = function(...)
+        if Config.NoRecoil then return end
+        return OrigShakeNew(...)
+    end
+end
+
+if GameModules.Stats and OrigGetStats then
+    GameModules.Stats.getStatsForAttachments = function(...)
+        local stats, disp = OrigGetStats(...)
+        if type(stats) == "table" then
+            if Config.NoRecoil then patchStatTable(stats, RecoilKeys, true) end
+            if Config.NoSpread then patchStatTable(stats, SpreadKeys, true) end
+        end
+        return stats, disp
+    end
+end
+
+if GameModules.Projectile and OrigProjNew then
+    GameModules.Projectile.new = function(weapon, ...)
+        if Config.NoSpread and type(weapon) == "table" then
+            if type(weapon.stats) == "table" then
+                patchStatTable(weapon.stats, SpreadKeys, true)
+            end
+            local prevState = weapon.state
+            weapon.state = "aim"
+            local ok, res = pcall(OrigProjNew, weapon, ...)
+            weapon.state = prevState
+            if ok then return res end
+        end
+        return OrigProjNew(weapon, ...)
+    end
+end
+
+-- =========================================================================
+-- Drawing утилиты & Raycast
+-- =========================================================================
 local function newLine(thickness, color, zIndex)
     local line = Drawing.new("Line")
     line.Visible = false
@@ -173,8 +303,9 @@ local function isEnemy(player)
         return false
     end
 
-    if LostFrontRegistry and LostFrontRegistry.players and LostFrontRegistry.players[player] and LostFrontRegistry.isFriendly then
-        local ok, friendly = pcall(LostFrontRegistry.isFriendly, player)
+    local reg = GameModules.Registry
+    if reg and reg.players and reg.players[player] and reg.isFriendly then
+        local ok, friendly = pcall(reg.isFriendly, player)
         if ok and friendly then
             return false
         end
@@ -357,7 +488,6 @@ local function computeBoxFromParts(model, filterSet)
     return minX, minY, maxX - minX, maxY - minY
 end
 
--- Кэш ESP игроков
 local MAX_BONES = 18
 local ESPCache = {}
 
@@ -409,7 +539,6 @@ end
 table.insert(Connections, Players.PlayerAdded:Connect(createPlayerESP))
 table.insert(Connections, Players.PlayerRemoving:Connect(removePlayerESP))
 
--- Кэш ESP FPV-дронов (Lost Front: тег "drone" и папка IllllII_iiii)
 local DroneCache = {}
 
 local function trackDrone(drone)
@@ -519,8 +648,8 @@ makeDraggable(TogglePill, TogglePill)
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.fromOffset(252, 324)
-MainFrame.Position = UDim2.new(0.5, -126, 0.5, -162)
+MainFrame.Size = UDim2.fromOffset(252, 336)
+MainFrame.Position = UDim2.new(0.5, -126, 0.5, -168)
 MainFrame.BackgroundColor3 = Palette.Bg
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
@@ -639,7 +768,7 @@ TabESPBtn.MouseButton1Click:Connect(function() setActiveTab("ESP") end)
 TabAIMBtn.MouseButton1Click:Connect(function() setActiveTab("AIM") end)
 setActiveTab("ESP")
 
-local function addToggle(parent, labelText, configKey)
+local function addToggle(parent, labelText, configKey, onChanged)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 34)
     btn.BackgroundColor3 = Palette.Card
@@ -695,6 +824,7 @@ local function addToggle(parent, labelText, configKey)
     btn.MouseButton1Click:Connect(function()
         Config[configKey] = not Config[configKey]
         refresh(false)
+        if onChanged then onChanged(Config[configKey]) end
     end)
 
     refresh(true)
@@ -844,6 +974,8 @@ addToggle(PageAIM, "Aimbot", "Aimbot")
 addToggle(PageAIM, "Visible Check", "VisibleCheck")
 addToggle(PageAIM, "Line to Target", "LineToTarget")
 addToggle(PageAIM, "Show FOV", "ShowFOV")
+addToggle(PageAIM, "No Recoil", "NoRecoil", applyWeaponMods)
+addToggle(PageAIM, "No Spread", "NoSpread", applyWeaponMods)
 addCycle(PageAIM, "Target Part", "TargetPart", { "Head", "UpperTorso" })
 addSlider(PageAIM, "Aim FOV", "AimFOV", 30, 300, 0)
 addSlider(PageAIM, "Aim Speed", "AimSpeed", 0.15, 1.00, 2)
@@ -926,9 +1058,24 @@ RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, 
 end)
 
 -- =========================================================================
--- Отрисовка ESP игроков, FPV-дронов, FOV и Line to Target
+-- Отрисовка ESP + гашение kickback
 -- =========================================================================
+local activeFolder = ReplicatedStorage:FindFirstChild("active")
+local clientFolder = activeFolder and activeFolder:FindFirstChild("client")
+local kickbackVal  = clientFolder and clientFolder:FindFirstChild("Kickback")
+
 table.insert(Connections, RunService.RenderStepped:Connect(function()
+    if Config.NoRecoil then
+        if not kickbackVal then
+            activeFolder = ReplicatedStorage:FindFirstChild("active")
+            clientFolder = activeFolder and activeFolder:FindFirstChild("client")
+            kickbackVal  = clientFolder and clientFolder:FindFirstChild("Kickback")
+        end
+        if kickbackVal then
+            kickbackVal.Value = 0
+        end
+    end
+
     Camera = workspace.CurrentCamera
     if not Camera then return end
 
@@ -946,7 +1093,6 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
         FOVCircle.Radius = Config.AimFOV
     end
 
-    -- Игроки
     for player, data in pairs(ESPCache) do
         local char = player.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -1046,7 +1192,6 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
         end
     end
 
-    -- FPV-дроны
     for drone, data in pairs(DroneCache) do
         if not Config.FPVESP or not drone.Parent or not drone:IsDescendantOf(workspace) then
             hideDroneESP(data)
@@ -1111,7 +1256,6 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
         data.Label.Visible = true
     end
 
-    -- Line to Target
     if Config.LineToTarget and currentTargetPart and currentTargetPart.Parent then
         local pos, onScreen = Camera:WorldToViewportPoint(currentTargetPart.Position)
         if onScreen and pos.Z > 0 then
@@ -1135,6 +1279,9 @@ end))
 
 _G.OcelHubCleanup = function()
     pcall(function() RunService:UnbindFromRenderStep("OcelAimbot") end)
+    if GameModules.Shake and OrigShakeNew then GameModules.Shake.new = OrigShakeNew end
+    if GameModules.Stats and OrigGetStats then GameModules.Stats.getStatsForAttachments = OrigGetStats end
+    if GameModules.Projectile and OrigProjNew then GameModules.Projectile.new = OrigProjNew end
     for _, conn in ipairs(Connections) do
         pcall(function() conn:Disconnect() end)
     end
