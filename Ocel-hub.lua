@@ -1,5 +1,5 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *Lost Front: Silent Aim (Camera Spoof + FastCast Hook), AC-Safe Highlight, Improved Aimbot, 12 Expandable Chams*
+-- *Lost Front: Hybrid & Raycast Silent Aim (__namecall + FastCast + Shot-Window Lock), 2-Pass Aimbot, 12 Expandable Chams*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -33,6 +33,8 @@ local GameModules = {
     Items = nil,
     FastCast = nil,
     ActiveCast = nil,
+    Packet = nil,
+    LookPacket = nil,
 }
 
 pcall(function()
@@ -53,6 +55,13 @@ pcall(function()
     GameModules.Items      = safeImport("IIIlllIIIIIIlllllIlllIlIIlIIIlllIIIllIIlIlIIIlIlllllIIlllllI")
     GameModules.FastCast   = safeImport("IlIllIllIIIIllllIllllIlIIlIIIIIIIIllIlIlIlllIIllIllIllIIllIl")
     GameModules.ActiveCast = safeImport("lIlIIlIIIlllIIIlIlIIlIIIlIlIIllIllIIlIIIIlllIIIIlIIlIIIllllI")
+    GameModules.Packet     = safeImport("IllIIllIllIlIIIlIIllIlIIIIlIllllllIllIllIIlIllIIIlllllIlIIll")
+
+    if GameModules.Packet then
+        pcall(function()
+            GameModules.LookPacket = GameModules.Packet("event.lookvector", GameModules.Packet.NumberF16)
+        end)
+    end
 end)
 
 local ChamStyleList = {
@@ -81,6 +90,7 @@ local Config = {
     -- Aimbot & Combat
     Aimbot = false,
     SilentAim = false,
+    SilentMode = "Hybrid", -- "Hybrid" | "Raycast"
     Prediction = true,
     VisibleCheck = true,
     LineToTarget = true,
@@ -480,7 +490,7 @@ local function spawnBulletTracer(weapon, customOrigin, customHitPos)
 end
 
 -- =========================================================================
--- No Recoil, No Spread & Silent Aim (Camera Micro-Spoof + FastCast Hook)
+-- No Recoil, No Spread & Silent Aim (Hybrid Shot-Lock + Raycast __namecall)
 -- =========================================================================
 local RecoilKeys = {
     recoil_magnitude = 0,
@@ -566,6 +576,22 @@ local ActiveSilentRoot = nil
 local LastSilentOrigin = nil
 local LastSilentHitPos = nil
 
+-- Состояние Hybrid-режима (удержание наводки на время выстрела/очереди + возврат камеры)
+local HybridUntil = 0
+local HybridRestoreCF = nil
+local HybridTargetPart = nil
+local HybridTargetRoot = nil
+
+local function getActiveSilentTarget(originPos)
+    local tPart, tRoot = ActiveSilentTarget, ActiveSilentRoot
+    if not tPart or not tPart.Parent then
+        local vpSize = Camera.ViewportSize
+        local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+        tPart, tRoot = findBestTarget(screenCenter, originPos, false)
+    end
+    return tPart, tRoot
+end
+
 local function redirectCastForSilentAim(origin, direction, velocity, behavior)
     if not Config.SilentAim or not Camera or typeof(origin) ~= "Vector3" then
         return direction, velocity
@@ -575,12 +601,7 @@ local function redirectCastForSilentAim(origin, direction, velocity, behavior)
         return direction, velocity
     end
 
-    local targetPart, rootPart = ActiveSilentTarget, ActiveSilentRoot
-    if not targetPart or not targetPart.Parent then
-        local vpSize = Camera.ViewportSize
-        local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
-        targetPart, rootPart = findBestTarget(screenCenter, origin, false)
-    end
+    local targetPart, rootPart = getActiveSilentTarget(origin)
     if not targetPart then
         return direction, velocity
     end
@@ -597,6 +618,43 @@ local function redirectCastForSilentAim(origin, direction, velocity, behavior)
         return newDir, newDir * velocity.Magnitude
     end
     return newDir, velocity
+end
+
+-- Единый __namecall Raycast-перехват (не стакается при перезапусках)
+_G.OcelHookState = _G.OcelHookState or {}
+_G.OcelHookState.Active = true
+_G.OcelHookState.Handler = function(self, oldNamecall, origin, direction, params)
+    if not Config.SilentAim or not Camera then return false end
+    if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return false end
+    if not IsLocalShooting and (origin - Camera.CFrame.Position).Magnitude > 8 then return false end
+
+    local targetPart, rootPart = getActiveSilentTarget(origin)
+    if not targetPart then return false end
+
+    local aimPos = getPredictedAimPos(origin, targetPart, rootPart)
+    local newDir = (aimPos - origin).Unit * direction.Magnitude
+    LastSilentOrigin = origin
+    LastSilentHitPos = aimPos
+    return true, oldNamecall(self, origin, newDir, params)
+end
+
+if not _G.OcelHookState.Installed and hookmetamethod and getnamecallmethod and checkcaller then
+    pcall(function()
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local state = _G.OcelHookState
+            if state and state.Active and state.Handler and not checkcaller() then
+                if self == workspace and getnamecallmethod() == "Raycast" then
+                    local ok, handled, res = pcall(state.Handler, self, oldNamecall, ...)
+                    if ok and handled then
+                        return res
+                    end
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+        _G.OcelHookState.Installed = true
+    end)
 end
 
 local OrigShakeNew      = GameModules.Shake and GameModules.Shake.new
@@ -653,7 +711,6 @@ if GameModules.Projectile and OrigProjNew then
         LastSilentOrigin = nil
         LastSilentHitPos = nil
 
-        -- Микро-спуф Camera.CFrame на момент расчёта и отправки пакета выстрела на сервер
         local savedCamCF = nil
         if Config.SilentAim and Camera then
             local vpSize = Camera.ViewportSize
@@ -662,10 +719,30 @@ if GameModules.Projectile and OrigProjNew then
             if tPart then
                 ActiveSilentTarget = tPart
                 ActiveSilentRoot = tRoot
-                savedCamCF = Camera.CFrame
-                local aimPos = getPredictedAimPos(savedCamCF.Position, tPart, tRoot)
-                Camera.CFrame = CFrame.lookAt(savedCamCF.Position, aimPos)
+                local aimPos = getPredictedAimPos(Camera.CFrame.Position, tPart, tRoot)
                 LastSilentHitPos = aimPos
+
+                -- Принудительная синхронизация lookvector на сервер (обход 0.1s дебаунса sender)
+                if GameModules.LookPacket then
+                    local aimDir = (aimPos - Camera.CFrame.Position).Unit
+                    local pitch = tonumber(string.format("%.3f", math.asin(math.clamp(aimDir.Y, -1, 1))))
+                    if pitch then
+                        pcall(function() GameModules.LookPacket:Fire(pitch) end)
+                    end
+                end
+
+                if Config.SilentMode == "Hybrid" then
+                    if not HybridRestoreCF then
+                        HybridRestoreCF = Camera.CFrame
+                    end
+                    HybridTargetPart = tPart
+                    HybridTargetRoot = tRoot
+                    HybridUntil = tick() + 0.13
+                    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, aimPos)
+                else
+                    savedCamCF = Camera.CFrame
+                    Camera.CFrame = CFrame.lookAt(savedCamCF.Position, aimPos)
+                end
             end
         end
 
@@ -1542,6 +1619,7 @@ end
 
 addToggle(PageAIM, "Aimbot", "Aimbot")
 addToggle(PageAIM, "Silent Aim", "SilentAim")
+addDropdown(PageAIM, "Silent Mode", "SilentMode", { "Hybrid", "Raycast" })
 addToggle(PageAIM, "Prediction (Long)", "Prediction")
 addToggle(PageAIM, "Visible Check", "VisibleCheck")
 addToggle(PageAIM, "Line to Target", "LineToTarget")
@@ -1586,7 +1664,7 @@ table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gp
 end))
 
 -- =========================================================================
--- Цикл Aimbot (RenderPriority 199) + Цикл ESP/Chams (RenderStepped)
+-- Цикл Aimbot + Hybrid Lock (RenderPriority 199) и ESP/Chams (RenderStepped)
 -- =========================================================================
 local currentTargetPart = nil
 
@@ -1594,6 +1672,7 @@ RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, 
     Camera = workspace.CurrentCamera
     if not Camera then return end
 
+    local now = tick()
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
 
@@ -1603,6 +1682,19 @@ RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, 
     else
         currentTargetPart = nil
         LockedPlayer = nil
+    end
+
+    local isHybridLock = Config.SilentAim and Config.SilentMode == "Hybrid" and now < HybridUntil
+    if isHybridLock and HybridTargetPart and HybridTargetPart.Parent and Camera.CameraType ~= Enum.CameraType.Scriptable then
+        local camPos = Camera.CFrame.Position
+        local aimPos = getPredictedAimPos(camPos, HybridTargetPart, HybridTargetRoot)
+        Camera.CFrame = CFrame.lookAt(camPos, aimPos)
+        return
+    elseif HybridRestoreCF and not Config.Aimbot then
+        Camera.CFrame = HybridRestoreCF
+        HybridRestoreCF = nil
+        HybridTargetPart = nil
+        HybridTargetRoot = nil
     end
 
     if Config.Aimbot and currentTargetPart and Camera.CameraType ~= Enum.CameraType.Scriptable then
@@ -1690,7 +1782,7 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
             local hl = EnemyHighlights[char]
             if not hl or not hl.Parent then
                 hl = Instance.new("Highlight")
-                hl.Name = "spectateHighlight" -- в белом списке античита игры
+                hl.Name = "spectateHighlight"
                 hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
                 hl.Adornee = char
                 hl.Parent = char
@@ -1876,6 +1968,10 @@ end))
 
 _G.OcelHubCleanup = function()
     pcall(function() RunService:UnbindFromRenderStep("OcelAimbot") end)
+    if _G.OcelHookState then
+        _G.OcelHookState.Active = false
+        _G.OcelHookState.Handler = nil
+    end
     if GameModules.Shake and OrigShakeNew then GameModules.Shake.new = OrigShakeNew end
     if GameModules.Stats and OrigGetStats then GameModules.Stats.getStatsForAttachments = OrigGetStats end
     if GameModules.Projectile and OrigProjNew then GameModules.Projectile.new = OrigProjNew end
