@@ -1,5 +1,5 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *Lost Front: Hybrid & Raycast Silent Aim (__namecall + FastCast + Shot-Window Lock), 2-Pass Aimbot, 12 Expandable Chams*
+-- *Lost Front: Zero-Lag Chams Cache, All-Ray Silent Aim (Raycast + FindPartOnRay* + ViewportPointToRay + FastCast + Hybrid), 2-Pass Aimbot*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -77,6 +77,16 @@ local ChamStyleList = {
     "Ghost Glass",
     "RGB Flow",
     "Monochrome",
+}
+
+local AnimatedStyles = {
+    ["Water Flow"] = true,
+    ["Glossy Flow"] = true,
+    ["Lava Flow"] = true,
+    ["Toxic Pulse"] = true,
+    ["Galaxy Flow"] = true,
+    ["RGB Flow"] = true,
+    ["Monochrome"] = true,
 }
 
 local Config = {
@@ -258,6 +268,7 @@ end
 -- =========================================================================
 local MAX_BONES = 18
 local ESPCache = {}
+local ESPVisCache = {}
 
 local function createPlayerESP(player)
     if ESPCache[player] then return end
@@ -299,6 +310,7 @@ local function removePlayerESP(player)
         data.Bones[i]:Remove()
     end
     ESPCache[player] = nil
+    ESPVisCache[player] = nil
 end
 
 for _, p in ipairs(Players:GetPlayers()) do
@@ -372,16 +384,22 @@ local function findBestTarget(screenCenter, originOverride, useSticky)
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         local root = char and char:FindFirstChild("HumanoidRootPart")
         if char and hum and hum.Health > 0 and root and isEnemy(player) then
-            local aimPart = resolveTargetPartForChar(char, screenCenter, checkOrigin)
-            if aimPart then
-                local pos, onScreen = Camera:WorldToViewportPoint(aimPart.Position)
+            local rawPart = char:FindFirstChild(Config.TargetPart == "Nearest" and "Head" or Config.TargetPart)
+                or char:FindFirstChild("Torso")
+                or char:FindFirstChild("Head")
+                or root
+            if rawPart then
+                local pos, onScreen = Camera:WorldToViewportPoint(rawPart.Position)
                 if onScreen and pos.Z > 0 then
                     local dist = (Vector2.new(pos.X, pos.Y) - screenCenter).Magnitude
                     if dist < bestScreenDist then
-                        bestScreenDist = dist
-                        bestPlayer = player
-                        bestPart = aimPart
-                        bestRoot = root
+                        local aimPart = resolveTargetPartForChar(char, screenCenter, checkOrigin)
+                        if aimPart then
+                            bestScreenDist = dist
+                            bestPlayer = player
+                            bestPart = aimPart
+                            bestRoot = root
+                        end
                     end
                 end
             end
@@ -490,7 +508,7 @@ local function spawnBulletTracer(weapon, customOrigin, customHitPos)
 end
 
 -- =========================================================================
--- No Recoil, No Spread & Silent Aim (Hybrid Shot-Lock + Raycast __namecall)
+-- No Recoil, No Spread & Silent Aim (Raycast + FindPartOnRay* + ViewportPointToRay + FastCast + Hybrid)
 -- =========================================================================
 local RecoilKeys = {
     recoil_magnitude = 0,
@@ -570,13 +588,11 @@ local function updateBallisticsFromStats(stats)
     end
 end
 
-local IsLocalShooting = false
 local ActiveSilentTarget = nil
 local ActiveSilentRoot = nil
 local LastSilentOrigin = nil
 local LastSilentHitPos = nil
 
--- Состояние Hybrid-режима (удержание наводки на время выстрела/очереди + возврат камеры)
 local HybridUntil = 0
 local HybridRestoreCF = nil
 local HybridTargetPart = nil
@@ -596,7 +612,8 @@ local function redirectCastForSilentAim(origin, direction, velocity, behavior)
     if not Config.SilentAim or not Camera or typeof(origin) ~= "Vector3" then
         return direction, velocity
     end
-    local isMine = IsLocalShooting or ((origin - Camera.CFrame.Position).Magnitude < 12)
+    local state = _G.OcelHookState
+    local isMine = (state and state.Shooting) or ((origin - Camera.CFrame.Position).Magnitude < 12)
     if not isMine then
         return direction, velocity
     end
@@ -620,22 +637,51 @@ local function redirectCastForSilentAim(origin, direction, velocity, behavior)
     return newDir, velocity
 end
 
--- Единый __namecall Raycast-перехват (не стакается при перезапусках)
+-- Единый __namecall с нулевым оверхедом вне выстрела (перехватывает Raycast, FindPartOnRay*, Screen/ViewportPointToRay)
 _G.OcelHookState = _G.OcelHookState or {}
 _G.OcelHookState.Active = true
-_G.OcelHookState.Handler = function(self, oldNamecall, origin, direction, params)
+_G.OcelHookState.Shooting = false
+_G.OcelHookState.Handler = function(self, oldNamecall, method, ...)
     if not Config.SilentAim or not Camera then return false end
-    if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return false end
-    if not IsLocalShooting and (origin - Camera.CFrame.Position).Magnitude > 8 then return false end
+    local args = { ... }
 
-    local targetPart, rootPart = getActiveSilentTarget(origin)
-    if not targetPart then return false end
+    if method == "Raycast" and self == workspace then
+        local origin, dir, params = args[1], args[2], args[3]
+        if typeof(origin) == "Vector3" and typeof(dir) == "Vector3" then
+            local tPart, tRoot = getActiveSilentTarget(origin)
+            if tPart then
+                local aimPos = getPredictedAimPos(origin, tPart, tRoot)
+                local newDir = (aimPos - origin).Unit * dir.Magnitude
+                LastSilentOrigin = origin
+                LastSilentHitPos = aimPos
+                return true, oldNamecall(self, origin, newDir, params)
+            end
+        end
+    elseif (method == "FindPartOnRay" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRayWithWhitelist") and self == workspace then
+        local ray = args[1]
+        if typeof(ray) == "Ray" then
+            local tPart, tRoot = getActiveSilentTarget(ray.Origin)
+            if tPart then
+                local aimPos = getPredictedAimPos(ray.Origin, tPart, tRoot)
+                local newDir = (aimPos - ray.Origin).Unit * ray.Direction.Magnitude
+                args[1] = Ray.new(ray.Origin, newDir)
+                LastSilentOrigin = ray.Origin
+                LastSilentHitPos = aimPos
+                return true, oldNamecall(self, table.unpack(args))
+            end
+        end
+    elseif (method == "ViewportPointToRay" or method == "ScreenPointToRay") and self == Camera then
+        local camOrigin = Camera.CFrame.Position
+        local tPart, tRoot = getActiveSilentTarget(camOrigin)
+        if tPart then
+            local aimPos = getPredictedAimPos(camOrigin, tPart, tRoot)
+            LastSilentOrigin = camOrigin
+            LastSilentHitPos = aimPos
+            return true, Ray.new(camOrigin, (aimPos - camOrigin).Unit)
+        end
+    end
 
-    local aimPos = getPredictedAimPos(origin, targetPart, rootPart)
-    local newDir = (aimPos - origin).Unit * direction.Magnitude
-    LastSilentOrigin = origin
-    LastSilentHitPos = aimPos
-    return true, oldNamecall(self, origin, newDir, params)
+    return false
 end
 
 if not _G.OcelHookState.Installed and hookmetamethod and getnamecallmethod and checkcaller then
@@ -643,10 +689,11 @@ if not _G.OcelHookState.Installed and hookmetamethod and getnamecallmethod and c
         local oldNamecall
         oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
             local state = _G.OcelHookState
-            if state and state.Active and state.Handler and not checkcaller() then
-                if self == workspace and getnamecallmethod() == "Raycast" then
-                    local ok, handled, res = pcall(state.Handler, self, oldNamecall, ...)
-                    if ok and handled then
+            if state and state.Active and state.Shooting and (self == workspace or self == Camera) and not checkcaller() then
+                local method = getnamecallmethod()
+                if method == "Raycast" or method == "FindPartOnRayWithIgnoreList" or method == "FindPartOnRay" or method == "FindPartOnRayWithWhitelist" or method == "ViewportPointToRay" or method == "ScreenPointToRay" then
+                    local handled, res = state.Handler(self, oldNamecall, method, ...)
+                    if handled then
                         return res
                     end
                 end
@@ -705,7 +752,7 @@ if GameModules.Projectile and OrigProjNew then
             updateBallisticsFromStats(weapon.stats)
         end
 
-        IsLocalShooting = true
+        _G.OcelHookState.Shooting = true
         ActiveSilentTarget = nil
         ActiveSilentRoot = nil
         LastSilentOrigin = nil
@@ -722,7 +769,6 @@ if GameModules.Projectile and OrigProjNew then
                 local aimPos = getPredictedAimPos(Camera.CFrame.Position, tPart, tRoot)
                 LastSilentHitPos = aimPos
 
-                -- Принудительная синхронизация lookvector на сервер (обход 0.1s дебаунса sender)
                 if GameModules.LookPacket then
                     local aimDir = (aimPos - Camera.CFrame.Position).Unit
                     local pitch = tonumber(string.format("%.3f", math.asin(math.clamp(aimDir.Y, -1, 1))))
@@ -763,7 +809,7 @@ if GameModules.Projectile and OrigProjNew then
             Camera.CFrame = savedCamCF
         end
 
-        IsLocalShooting = false
+        _G.OcelHookState.Shooting = false
         ActiveSilentTarget = nil
         ActiveSilentRoot = nil
 
@@ -776,16 +822,20 @@ if GameModules.Projectile and OrigProjNew then
 end
 
 -- =========================================================================
--- Система Chams (Враги, Руки, Оружие + 12 стилей, белый список Highlight)
+-- Кэшированная система Chams (без лагов на мобилках)
 -- =========================================================================
 local OrigPartProps = {}
 local OrigSurfaceApp = {}
+local AppliedStyle = {} -- [part] = styleName (защита от повторной записи Material/TextureID каждый кадр)
 local TrackedChamParts = {
     Enemy = {},
     Hands = {},
     Weapon = {},
 }
 local EnemyHighlights = {}
+local EnemyPartCache = {} -- [char] = { part1, part2, ... }
+local ViewModelCache = { vm = nil, weapon = nil, hands = {}, gun = {}, conn = nil }
+local LastChamAnimUpdate = 0
 
 local function saveAndDisableSurfaceAppearances(part)
     for _, child in ipairs(part:GetChildren()) do
@@ -809,6 +859,7 @@ local function restorePartProps(part)
         end
     end)
     OrigPartProps[part] = nil
+    AppliedStyle[part] = nil
 end
 
 local function restoreSurfaceAppearancesFor(model)
@@ -864,8 +915,9 @@ local function getStyleProps(style, t, phase)
     end
 end
 
-local function applyChamToPart(part, groupName, style, t, phase)
-    if not part:IsA("BasePart") then return end
+local function applyChamToPart(part, groupName, style, t, phase, allowAnimColor)
+    if not part or not part.Parent or not part:IsA("BasePart") then return end
+
     if not OrigPartProps[part] then
         if part.Transparency >= 0.95 then return end
         OrigPartProps[part] = {
@@ -875,76 +927,122 @@ local function applyChamToPart(part, groupName, style, t, phase)
             Reflectance = part.Reflectance,
             TextureID = part:IsA("MeshPart") and part.TextureID or nil,
         }
+        saveAndDisableSurfaceAppearances(part)
     end
-    saveAndDisableSurfaceAppearances(part)
+
     TrackedChamParts[groupName][part] = true
 
-    local mat, col, trans, refl, tex = getStyleProps(style, t, phase)
-    part.Material = mat
-    part.Color = col
-    part.Transparency = trans
-    part.Reflectance = refl
-    if part:IsA("MeshPart") and tex ~= nil then
-        part.TextureID = tex
+    if AppliedStyle[part] ~= style then
+        AppliedStyle[part] = style
+        local mat, col, trans, refl, tex = getStyleProps(style, t, phase)
+        part.Material = mat
+        part.Color = col
+        part.Transparency = trans
+        part.Reflectance = refl
+        if part:IsA("MeshPart") and tex ~= nil then
+            part.TextureID = tex
+        end
+    elseif allowAnimColor and AnimatedStyles[style] then
+        local _, col = getStyleProps(style, t, phase)
+        part.Color = col
     end
 end
 
-local function updateAllChams(t)
-    local vm = Camera and Camera:FindFirstChild("ViewModel")
-    local weaponContainer = vm and vm:FindFirstChild("Model")
+local function rebuildViewModelCache(vm)
+    ViewModelCache.vm = vm
+    ViewModelCache.hands = {}
+    ViewModelCache.gun = {}
+    if ViewModelCache.conn then
+        pcall(function() ViewModelCache.conn:Disconnect() end)
+        ViewModelCache.conn = nil
+    end
+    if not vm then return end
 
-    if vm and (Config.HandsChams or Config.WeaponChams) then
-        local idx = 0
-        for _, desc in ipairs(vm:GetDescendants()) do
-            if desc:IsA("BasePart") then
-                idx = idx + 1
-                local isWeapon = weaponContainer and desc:IsDescendantOf(weaponContainer)
-                if isWeapon then
-                    if Config.WeaponChams then
-                        applyChamToPart(desc, "Weapon", Config.WeaponChamStyle, t, idx * 0.15)
-                    elseif TrackedChamParts.Weapon[desc] then
-                        restorePartProps(desc)
-                        TrackedChamParts.Weapon[desc] = nil
-                    end
-                elseif desc.Name ~= "HRP" then
-                    if Config.HandsChams then
-                        applyChamToPart(desc, "Hands", Config.HandsChamStyle, t, idx * 0.2)
-                    elseif TrackedChamParts.Hands[desc] then
-                        restorePartProps(desc)
-                        TrackedChamParts.Hands[desc] = nil
-                    end
-                end
+    local weaponContainer = vm:FindFirstChild("Model")
+    ViewModelCache.weapon = weaponContainer
+
+    local function classifyPart(desc)
+        if not desc:IsA("BasePart") or desc.Name == "HRP" then return end
+        if weaponContainer and desc:IsDescendantOf(weaponContainer) then
+            table.insert(ViewModelCache.gun, desc)
+        else
+            table.insert(ViewModelCache.hands, desc)
+        end
+    end
+
+    for _, desc in ipairs(vm:GetDescendants()) do
+        classifyPart(desc)
+    end
+
+    ViewModelCache.conn = vm.DescendantAdded:Connect(function(desc)
+        if desc:IsA("BasePart") then
+            classifyPart(desc)
+        end
+    end)
+    table.insert(Connections, ViewModelCache.conn)
+end
+
+local function getEnemyParts(char)
+    local cached = EnemyPartCache[char]
+    if cached then return cached end
+    local list = {}
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+            table.insert(list, part)
+        end
+    end
+    EnemyPartCache[char] = list
+    local c1, c2
+    c1 = char.DescendantAdded:Connect(function(d)
+        if d:IsA("BasePart") and d.Name ~= "HumanoidRootPart" then
+            table.insert(list, d)
+        end
+    end)
+    c2 = char.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            EnemyPartCache[char] = nil
+            pcall(function() c1:Disconnect() end)
+            pcall(function() c2:Disconnect() end)
+        end
+    end)
+    table.insert(Connections, c1)
+    table.insert(Connections, c2)
+    return list
+end
+
+local function updateViewModelChams(t, allowAnimColor)
+    local vm = Camera and Camera:FindFirstChild("ViewModel")
+    if vm ~= ViewModelCache.vm or (vm and vm:FindFirstChild("Model") ~= ViewModelCache.weapon) then
+        rebuildViewModelCache(vm)
+    end
+
+    if vm and Config.HandsChams then
+        for i, part in ipairs(ViewModelCache.hands) do
+            if part.Parent then
+                applyChamToPart(part, "Hands", Config.HandsChamStyle, t, i * 0.2, allowAnimColor)
             end
         end
+    elseif next(TrackedChamParts.Hands) then
+        clearChamGroup("Hands")
     end
 
-    if not Config.HandsChams then clearChamGroup("Hands") end
-    if not Config.WeaponChams then clearChamGroup("Weapon") end
+    if vm and Config.WeaponChams then
+        for i, part in ipairs(ViewModelCache.gun) do
+            if part.Parent then
+                applyChamToPart(part, "Weapon", Config.WeaponChamStyle, t, i * 0.15, allowAnimColor)
+            end
+        end
+    elseif next(TrackedChamParts.Weapon) then
+        clearChamGroup("Weapon")
+    end
 
-    for part in pairs(TrackedChamParts.Hands) do
-        if not part.Parent or (vm and not part:IsDescendantOf(vm)) then
-            restorePartProps(part)
-            TrackedChamParts.Hands[part] = nil
-        end
-    end
-    for part in pairs(TrackedChamParts.Weapon) do
-        if not part.Parent or (weaponContainer and not part:IsDescendantOf(weaponContainer)) then
-            restorePartProps(part)
-            TrackedChamParts.Weapon[part] = nil
-        end
-    end
     if not Config.HandsChams and not Config.WeaponChams and vm then
         restoreSurfaceAppearancesFor(vm)
-    end
-
-    if not Config.EnemyChams then
-        clearChamGroup("Enemy")
-        restoreSurfaceAppearancesFor(nil)
     end
 end
 
 -- =========================================================================
--- Скелет, 2D-боксы и FPV-дроны
+-- Скелет, 2D-боксы и FPV-дроны (оптимизированы под 60 FPS)
 -- =========================================================================
 local function getJointPoint(part, yFactor)
     return (part.CFrame * CFrame.new(0, part.Size.Y * yFactor, 0)).Position
@@ -1087,27 +1185,25 @@ local bodyPartsSet = {
     RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
 }
 
-local function computeBoxFromParts(model, filterSet)
+local function computeBoxFromParts(partList, filterSet)
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyVisible = false
 
-    for _, part in ipairs(model:GetDescendants()) do
+    for _, part in ipairs(partList) do
         if part:IsA("BasePart") and (not filterSet or filterSet[part.Name]) then
             local cf = part.CFrame
             local half = part.Size * 0.5
             for sx = -1, 1, 2 do
                 for sy = -1, 1, 2 do
-                    for sz = -1, 1, 2 do
-                        local corner = (cf * CFrame.new(half.X * sx, half.Y * sy, half.Z * sz)).Position
-                        local screenPos, onScreen = Camera:WorldToViewportPoint(corner)
-                        if screenPos.Z > 0 then
-                            if onScreen then anyVisible = true end
-                            if screenPos.X < minX then minX = screenPos.X end
-                            if screenPos.Y < minY then minY = screenPos.Y end
-                            if screenPos.X > maxX then maxX = screenPos.X end
-                            if screenPos.Y > maxY then maxY = screenPos.Y end
-                        end
+                    local corner = (cf * CFrame.new(half.X * sx, half.Y * sy, 0)).Position
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(corner)
+                    if screenPos.Z > 0 then
+                        if onScreen then anyVisible = true end
+                        if screenPos.X < minX then minX = screenPos.X end
+                        if screenPos.Y < minY then minY = screenPos.Y end
+                        if screenPos.X > maxX then maxX = screenPos.X end
+                        if screenPos.Y > maxY then maxY = screenPos.Y end
                     end
                 end
             end
@@ -1124,10 +1220,15 @@ local DroneCache = {}
 
 local function trackDrone(drone)
     if DroneCache[drone] or not drone:IsA("Model") then return end
+    local parts = {}
+    for _, d in ipairs(drone:GetDescendants()) do
+        if d:IsA("BasePart") then table.insert(parts, d) end
+    end
     DroneCache[drone] = {
         BoxOutline = newSquare(3, Palette.Black, 1),
         Box = newSquare(1.4, Palette.White, 2),
         Label = newText(13, Palette.White, 3),
+        Parts = parts,
     }
 end
 
@@ -1732,7 +1833,12 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
     Camera = workspace.CurrentCamera
     if not Camera then return end
 
-    updateAllChams(now)
+    local allowAnimColor = (now - LastChamAnimUpdate) >= 0.05
+    if allowAnimColor then
+        LastChamAnimUpdate = now
+    end
+
+    updateViewModelChams(now, allowAnimColor)
 
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
@@ -1746,6 +1852,10 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
         FOVCircleOutline.Radius = Config.AimFOV
         FOVCircle.Position = screenCenter
         FOVCircle.Radius = Config.AimFOV
+    end
+
+    if not Config.EnemyChams and next(TrackedChamParts.Enemy) then
+        clearChamGroup("Enemy")
     end
 
     for player, data in pairs(ESPCache) do
@@ -1767,16 +1877,20 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
             or char:FindFirstChild("Head")
             or root
 
-        local visible = isVisible(char, aimPart)
+        -- Троттлинг Visible Check для цвета ESP (10 Гц вместо 60 Гц)
+        local visEntry = ESPVisCache[player]
+        if not visEntry or now >= visEntry.nextCheck then
+            local vis = isVisible(char, aimPart)
+            visEntry = { visible = vis, nextCheck = now + 0.1 }
+            ESPVisCache[player] = visEntry
+        end
+        local visible = visEntry.visible
         local drawColor = (Config.ESPVisibleColor and not visible) and Palette.Dim or Palette.White
 
         if Config.EnemyChams then
-            local idx = 0
-            for _, part in ipairs(char:GetDescendants()) do
-                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                    idx = idx + 1
-                    applyChamToPart(part, "Enemy", Config.EnemyChamStyle, now, idx * 0.12)
-                end
+            local parts = getEnemyParts(char)
+            for i, part in ipairs(parts) do
+                applyChamToPart(part, "Enemy", Config.EnemyChamStyle, now, i * 0.12, allowAnimColor)
             end
 
             local hl = EnemyHighlights[char]
@@ -1787,21 +1901,26 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
                 hl.Adornee = char
                 hl.Parent = char
                 EnemyHighlights[char] = hl
+                local _, styleCol = getStyleProps(Config.EnemyChamStyle, now, 0)
+                local isWire = (Config.EnemyChamStyle == "Wireframe")
+                hl.FillColor = visible and styleCol or Color3.fromRGB(160, 70, 70)
+                hl.OutlineColor = visible and Palette.White or styleCol
+                hl.FillTransparency = isWire and 0.9 or (visible and 0.65 or 0.72)
+                hl.OutlineTransparency = 0
+            elseif allowAnimColor then
+                local _, styleCol = getStyleProps(Config.EnemyChamStyle, now, 0)
+                local isWire = (Config.EnemyChamStyle == "Wireframe")
+                hl.FillColor = visible and styleCol or Color3.fromRGB(160, 70, 70)
+                hl.OutlineColor = visible and Palette.White or styleCol
+                hl.FillTransparency = isWire and 0.9 or (visible and 0.65 or 0.72)
             end
-
-            local _, styleCol = getStyleProps(Config.EnemyChamStyle, now, 0)
-            local isWire = (Config.EnemyChamStyle == "Wireframe")
-            hl.FillColor = visible and styleCol or Color3.fromRGB(160, 70, 70)
-            hl.OutlineColor = visible and Palette.White or styleCol
-            hl.FillTransparency = isWire and 0.9 or (visible and 0.65 or 0.72)
-            hl.OutlineTransparency = 0
         elseif EnemyHighlights[char] then
             pcall(function() EnemyHighlights[char]:Destroy() end)
             EnemyHighlights[char] = nil
         end
 
         if Config.BoxESP then
-            local bx, by, bw, bh = computeBoxFromParts(char, bodyPartsSet)
+            local bx, by, bw, bh = computeBoxFromParts(char:GetChildren(), bodyPartsSet)
             if bx and bw > 2 and bh > 2 then
                 local boxPos = Vector2.new(bx, by)
                 local boxSize = Vector2.new(bw, bh)
@@ -1906,7 +2025,7 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
             continue
         end
 
-        local bx, by, bw, bh = computeBoxFromParts(drone, nil)
+        local bx, by, bw, bh = computeBoxFromParts(data.Parts, nil)
         if not bx then
             bx = centerPos.X - 8
             by = centerPos.Y - 8
@@ -1970,6 +2089,7 @@ _G.OcelHubCleanup = function()
     pcall(function() RunService:UnbindFromRenderStep("OcelAimbot") end)
     if _G.OcelHookState then
         _G.OcelHookState.Active = false
+        _G.OcelHookState.Shooting = false
         _G.OcelHookState.Handler = nil
     end
     if GameModules.Shake and OrigShakeNew then GameModules.Shake.new = OrigShakeNew end
