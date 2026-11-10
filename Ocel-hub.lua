@@ -1,5 +1,5 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *Lost Front: Silent Aim (FastCast Hook), Improved Aimbot, 12 Expandable Chams (Enemy/Hands/Weapon), Bullet Tracer, NoRecoil/NoSpread, ESP*
+-- *Lost Front: Silent Aim (Camera Spoof + FastCast Hook), AC-Safe Highlight, Improved Aimbot, 12 Expandable Chams*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -396,7 +396,6 @@ local function getPredictedAimPos(originPos, aimPart, rootPart, speedOverride, g
         vel = Vector3.zero
     end
 
-    -- 2-проходная итерация времени полёта для точного упреждения на дальней дистанции
     local t1 = math.clamp((rawPos - originPos).Magnitude / speed, 0, 1.5)
     local p1 = rawPos + vel * t1 + Vector3.new(0, 0.5 * grav * t1 * t1, 0)
     local t2 = math.clamp((p1 - originPos).Magnitude / speed, 0, 1.5)
@@ -481,7 +480,7 @@ local function spawnBulletTracer(weapon, customOrigin, customHitPos)
 end
 
 -- =========================================================================
--- No Recoil, No Spread & Silent Aim (FastCast / ActiveCast Hook)
+-- No Recoil, No Spread & Silent Aim (Camera Micro-Spoof + FastCast Hook)
 -- =========================================================================
 local RecoilKeys = {
     recoil_magnitude = 0,
@@ -562,6 +561,8 @@ local function updateBallisticsFromStats(stats)
 end
 
 local IsLocalShooting = false
+local ActiveSilentTarget = nil
+local ActiveSilentRoot = nil
 local LastSilentOrigin = nil
 local LastSilentHitPos = nil
 
@@ -574,9 +575,12 @@ local function redirectCastForSilentAim(origin, direction, velocity, behavior)
         return direction, velocity
     end
 
-    local vpSize = Camera.ViewportSize
-    local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
-    local targetPart, rootPart = findBestTarget(screenCenter, origin, false)
+    local targetPart, rootPart = ActiveSilentTarget, ActiveSilentRoot
+    if not targetPart or not targetPart.Parent then
+        local vpSize = Camera.ViewportSize
+        local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+        targetPart, rootPart = findBestTarget(screenCenter, origin, false)
+    end
     if not targetPart then
         return direction, velocity
     end
@@ -595,10 +599,10 @@ local function redirectCastForSilentAim(origin, direction, velocity, behavior)
     return newDir, velocity
 end
 
-local OrigShakeNew    = GameModules.Shake and GameModules.Shake.new
-local OrigGetStats    = GameModules.Stats and GameModules.Stats.getStatsForAttachments
-local OrigProjNew     = GameModules.Projectile and GameModules.Projectile.new
-local OrigFastCastFire = GameModules.FastCast and GameModules.FastCast.Fire
+local OrigShakeNew      = GameModules.Shake and GameModules.Shake.new
+local OrigGetStats      = GameModules.Stats and GameModules.Stats.getStatsForAttachments
+local OrigProjNew       = GameModules.Projectile and GameModules.Projectile.new
+local OrigFastCastFire  = GameModules.FastCast and GameModules.FastCast.Fire
 local OrigActiveCastNew = GameModules.ActiveCast and GameModules.ActiveCast.new
 
 if GameModules.Shake and OrigShakeNew then
@@ -644,8 +648,26 @@ if GameModules.Projectile and OrigProjNew then
         end
 
         IsLocalShooting = true
+        ActiveSilentTarget = nil
+        ActiveSilentRoot = nil
         LastSilentOrigin = nil
         LastSilentHitPos = nil
+
+        -- Микро-спуф Camera.CFrame на момент расчёта и отправки пакета выстрела на сервер
+        local savedCamCF = nil
+        if Config.SilentAim and Camera then
+            local vpSize = Camera.ViewportSize
+            local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+            local tPart, tRoot = findBestTarget(screenCenter, Camera.CFrame.Position, false)
+            if tPart then
+                ActiveSilentTarget = tPart
+                ActiveSilentRoot = tRoot
+                savedCamCF = Camera.CFrame
+                local aimPos = getPredictedAimPos(savedCamCF.Position, tPart, tRoot)
+                Camera.CFrame = CFrame.lookAt(savedCamCF.Position, aimPos)
+                LastSilentHitPos = aimPos
+            end
+        end
 
         local ok, res
         if Config.NoSpread and type(weapon) == "table" then
@@ -660,7 +682,14 @@ if GameModules.Projectile and OrigProjNew then
             ok, res = pcall(OrigProjNew, weapon, ...)
         end
 
+        if savedCamCF and Camera then
+            Camera.CFrame = savedCamCF
+        end
+
         IsLocalShooting = false
+        ActiveSilentTarget = nil
+        ActiveSilentRoot = nil
+
         spawnBulletTracer(weapon, LastSilentOrigin, LastSilentHitPos)
         LastSilentOrigin = nil
         LastSilentHitPos = nil
@@ -670,7 +699,7 @@ if GameModules.Projectile and OrigProjNew then
 end
 
 -- =========================================================================
--- Система Chams (Враги, Руки, Оружие + 12 стилей)
+-- Система Chams (Враги, Руки, Оружие + 12 стилей, белый список Highlight)
 -- =========================================================================
 local OrigPartProps = {}
 local OrigSurfaceApp = {}
@@ -838,7 +867,7 @@ local function updateAllChams(t)
 end
 
 -- =========================================================================
--- Скелет и 2D-боксы + FPV Дроны
+-- Скелет, 2D-боксы и FPV-дроны
 -- =========================================================================
 local function getJointPoint(part, yFactor)
     return (part.CFrame * CFrame.new(0, part.Size.Y * yFactor, 0)).Position
@@ -1311,7 +1340,6 @@ local function addToggle(parent, labelText, configKey, onChanged)
     refresh(true)
 end
 
--- Выдвижной список (аккордеон) с плавной анимацией открытия
 local OpenDropdowns = {}
 
 local function addDropdown(parent, labelText, configKey, options)
@@ -1357,19 +1385,19 @@ local function addDropdown(parent, labelText, configKey, options)
     valLbl.Parent = headerBtn
 
     local listFrame = Instance.new("Frame")
-    listFrame.Size = UDim2.new(1, -12, 0, #options * 26 + (#options - 1) * 4 + 6)
+    listFrame.Size = UDim2.new(1, -12, 0, #options * 24 + (#options - 1) * 3 + 6)
     listFrame.Position = UDim2.new(0, 6, 0, 36)
     listFrame.BackgroundTransparency = 1
     listFrame.Parent = holder
 
     local listLayout = Instance.new("UIListLayout")
-    listLayout.Padding = UDim.new(0, 4)
+    listLayout.Padding = UDim.new(0, 3)
     listLayout.SortOrder = Enum.SortOrder.LayoutOrder
     listLayout.Parent = listFrame
 
     local optionButtons = {}
     local expanded = false
-    local expandedHeight = 38 + #options * 26 + (#options - 1) * 4 + 6
+    local expandedHeight = 38 + #options * 24 + (#options - 1) * 3 + 6
 
     local function refreshOptionVisuals()
         for opt, b in pairs(optionButtons) do
@@ -1398,7 +1426,7 @@ local function addDropdown(parent, labelText, configKey, options)
 
     for i, opt in ipairs(options) do
         local optBtn = Instance.new("TextButton")
-        optBtn.Size = UDim2.new(1, 0, 0, 26)
+        optBtn.Size = UDim2.new(1, 0, 0, 24)
         optBtn.LayoutOrder = i
         optBtn.Text = opt
         optBtn.Font = Enum.Font.GothamBold
@@ -1512,7 +1540,6 @@ local function addSlider(parent, labelText, configKey, minVal, maxVal, decimals)
     updateFromRatio((Config[configKey] - minVal) / (maxVal - minVal))
 end
 
--- Вкладка AIM
 addToggle(PageAIM, "Aimbot", "Aimbot")
 addToggle(PageAIM, "Silent Aim", "SilentAim")
 addToggle(PageAIM, "Prediction (Long)", "Prediction")
@@ -1526,14 +1553,12 @@ addDropdown(PageAIM, "Target Part", "TargetPart", { "Head", "UpperTorso", "Neare
 addSlider(PageAIM, "Aim FOV", "AimFOV", 30, 300, 0)
 addSlider(PageAIM, "Aim Speed", "AimSpeed", 0.15, 1.00, 2)
 
--- Вкладка ESP
 addToggle(PageESP, "Boxes", "BoxESP")
 addToggle(PageESP, "Skeleton", "SkeletonESP")
 addToggle(PageESP, "FPV Drones", "FPVESP")
 addToggle(PageESP, "Visible Highlight", "ESPVisibleColor")
 addToggle(PageESP, "Team Check", "TeamCheck")
 
--- Вкладка CHAMS (с выдвижными списками разновидностей)
 addToggle(PageCHAMS, "Enemy Chams", "EnemyChams")
 addDropdown(PageCHAMS, "Enemy Style", "EnemyChamStyle", ChamStyleList)
 addToggle(PageCHAMS, "Hands Chams", "HandsChams")
@@ -1665,7 +1690,7 @@ table.insert(Connections, RunService.RenderStepped:Connect(function()
             local hl = EnemyHighlights[char]
             if not hl or not hl.Parent then
                 hl = Instance.new("Highlight")
-                hl.Name = "OcelEnemyCham"
+                hl.Name = "spectateHighlight" -- в белом списке античита игры
                 hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
                 hl.Adornee = char
                 hl.Parent = char
