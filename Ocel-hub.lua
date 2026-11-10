@@ -1,20 +1,34 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *Использует Camera.CFrame:Lerp вместо mousemoverel для стабильной работы на тач-устройствах*
+-- *Аимбот привязан к Enum.RenderPriority.Camera.Value - 1 (до camShake/ResetCF)*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
--- Очистка предыдущего инстанса при повторном запуске
+-- Очистка предыдущего инстанса и бинда при повторном запуске
+pcall(function() RunService:UnbindFromRenderStep("OcelAimbot") end)
 local uiParent = (gethui and gethui()) or CoreGui
 pcall(function()
     local old = uiParent:FindFirstChild("OcelHub_UI")
     if old then old:Destroy() end
+end)
+
+-- Клиентский реестр команд Lost Front (fallback помимо PlayerGui/teamHighlight)
+local LostFrontRegistry = nil
+pcall(function()
+    local loaderMod = ReplicatedStorage:FindFirstChild("lIIIlIIllIIlllIIIlllllIIlIIIIIlllIIIlIlllIllllIlIIIllIlIIIIl")
+    if loaderMod then
+        local loader = require(loaderMod)
+        if loader and loader.import then
+            LostFrontRegistry = loader.import("llIlIIlIllIlllIlIIlIlIIlllIIIlllIlIllllIIllIlllIlllIlIllIlII")
+        end
+    end
 end)
 
 local Config = {
@@ -23,7 +37,7 @@ local Config = {
     BoxESP = true,
     SkeletonESP = true,
     ESPVisibleColor = true,
-    TeamCheck = false,
+    TeamCheck = true,
     -- Aimbot
     Aimbot = false,
     VisibleCheck = true,
@@ -44,7 +58,6 @@ local Palette = {
     Black = Color3.fromRGB(0, 0, 0),
 }
 
--- Утилиты Drawing
 local function newLine(thickness, color, zIndex)
     local line = Drawing.new("Line")
     line.Visible = false
@@ -78,17 +91,19 @@ local function newCircle(thickness, color, numSides, zIndex)
     return c
 end
 
--- Raycast проверка видимости (игнорирует прозрачные/неколлизионные преграды)
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 
 local function isVisible(targetChar, targetPart)
-    if not targetChar or not targetPart then return false end
-    local camPos = Camera.CFrame.Position
-    local origin = camPos
+    if not targetChar or not targetPart or not Camera then return false end
+    local origin = Camera.CFrame.Position
     local targetPos = targetPart.Position
-    local ignoreList = { LocalPlayer.Character }
+    local ignoreList = {}
+    if LocalPlayer.Character then table.insert(ignoreList, LocalPlayer.Character) end
+    if Camera then table.insert(ignoreList, Camera) end
+    local ignoreFolder = workspace:FindFirstChild("ignore")
+    if ignoreFolder then table.insert(ignoreList, ignoreFolder) end
 
     for _ = 1, 4 do
         rayParams.FilterDescendantsInstances = ignoreList
@@ -113,9 +128,36 @@ end
 
 local function isEnemy(player)
     if player == LocalPlayer then return false end
-    if Config.TeamCheck and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+    if not Config.TeamCheck then return true end
+
+    if LocalPlayer.Team and player.Team and player.Team == LocalPlayer.Team then
         return false
     end
+
+    local myChar = LocalPlayer.Character
+    local theirChar = player.Character
+    if myChar and theirChar and myChar.Parent and theirChar.Parent == myChar.Parent and myChar.Parent ~= workspace then
+        return false
+    end
+
+    local teamHl = ReplicatedStorage:FindFirstChild("teamHighlight")
+    if teamHl and teamHl:IsA("Highlight") and teamHl.Adornee and theirChar and theirChar:IsDescendantOf(teamHl.Adornee) then
+        return false
+    end
+
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local nametags = pGui and pGui:FindFirstChild("nametags")
+    if nametags and nametags:FindFirstChild(player.Name) then
+        return false
+    end
+
+    if LostFrontRegistry and LostFrontRegistry.players and LostFrontRegistry.players[player] and LostFrontRegistry.isFriendly then
+        local ok, friendly = pcall(LostFrontRegistry.isFriendly, player)
+        if ok and friendly then
+            return false
+        end
+    end
+
     return true
 end
 
@@ -123,7 +165,6 @@ local function getJointPoint(part, yFactor)
     return (part.CFrame * CFrame.new(0, part.Size.Y * yFactor, 0)).Position
 end
 
--- Проработанный скелет: соединение по анатомическим точкам суставов для R15 и R6
 local function getSkeletonSegments(char)
     local segments = {}
     local head = char:FindFirstChild("Head")
@@ -133,13 +174,10 @@ local function getSkeletonSegments(char)
     local lowerTorso = char:FindFirstChild("LowerTorso")
 
     if upperTorso and lowerTorso then
-        -- R15
         local neck = getJointPoint(upperTorso, 0.42)
         local chest = upperTorso.Position
         local pelvis = getJointPoint(lowerTorso, -0.38)
-        local headCenter = head.Position
-
-        table.insert(segments, { headCenter, neck })
+        table.insert(segments, { head.Position, neck })
         table.insert(segments, { neck, chest })
         table.insert(segments, { chest, pelvis })
 
@@ -154,9 +192,7 @@ local function getSkeletonSegments(char)
             if lLA then
                 local wr = getJointPoint(lLA, -0.4)
                 table.insert(segments, { el, wr })
-                if lH then
-                    table.insert(segments, { wr, getJointPoint(lH, -0.35) })
-                end
+                if lH then table.insert(segments, { wr, getJointPoint(lH, -0.35) }) end
             end
         end
 
@@ -171,9 +207,7 @@ local function getSkeletonSegments(char)
             if rLA then
                 local wr = getJointPoint(rLA, -0.4)
                 table.insert(segments, { el, wr })
-                if rH then
-                    table.insert(segments, { wr, getJointPoint(rH, -0.35) })
-                end
+                if rH then table.insert(segments, { wr, getJointPoint(rH, -0.35) }) end
             end
         end
 
@@ -188,9 +222,7 @@ local function getSkeletonSegments(char)
             if lLL then
                 local ankle = getJointPoint(lLL, -0.42)
                 table.insert(segments, { knee, ankle })
-                if lF then
-                    table.insert(segments, { ankle, getJointPoint(lF, -0.3) })
-                end
+                if lF then table.insert(segments, { ankle, getJointPoint(lF, -0.3) }) end
             end
         end
 
@@ -205,13 +237,10 @@ local function getSkeletonSegments(char)
             if rLL then
                 local ankle = getJointPoint(rLL, -0.42)
                 table.insert(segments, { knee, ankle })
-                if rF then
-                    table.insert(segments, { ankle, getJointPoint(rF, -0.3) })
-                end
+                if rF then table.insert(segments, { ankle, getJointPoint(rF, -0.3) }) end
             end
         end
     else
-        -- R6
         local torso = char:FindFirstChild("Torso")
         if torso then
             local neck = getJointPoint(torso, 0.45)
@@ -273,7 +302,6 @@ local bodyPartsSet = {
     RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
 }
 
--- Точный 2D бокс по углам частей тела (без мусорных расширений от инструментов)
 local function computeCharacterBox(char)
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
@@ -307,7 +335,6 @@ local function computeCharacterBox(char)
     return minX, minY, maxX - minX, maxY - minY
 end
 
--- Пул Drawing-объектов на игрока
 local MAX_BONES = 18
 local ESPCache = {}
 
@@ -359,14 +386,13 @@ end
 Players.PlayerAdded:Connect(createPlayerESP)
 Players.PlayerRemoving:Connect(removePlayerESP)
 
--- Элементы Aimbot Drawing
 local FOVCircleOutline = newCircle(2.5, Palette.Black, 64, 3)
 local FOVCircle = newCircle(1.2, Palette.White, 64, 4)
 local TargetLineOutline = newLine(3, Palette.Black, 3)
 local TargetLine = newLine(1.4, Palette.White, 4)
 
 -- =========================================================================
--- Ocel-hub UI (Черно-белый минимализм, тач + мышь)
+-- Ocel-hub UI
 -- =========================================================================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "OcelHub_UI"
@@ -408,7 +434,6 @@ local function makeDraggable(dragHandle, moveTarget)
     end)
 end
 
--- Плавающая кнопка открытия меню для мобилок
 local TogglePill = Instance.new("TextButton")
 TogglePill.Name = "OcelPill"
 TogglePill.Size = UDim2.fromOffset(74, 30)
@@ -421,18 +446,12 @@ TogglePill.TextSize = 12
 TogglePill.AutoButtonColor = false
 TogglePill.Parent = ScreenGui
 
-local pillCorner = Instance.new("UICorner")
-pillCorner.CornerRadius = UDim.new(0, 8)
-pillCorner.Parent = TogglePill
-
-local pillStroke = Instance.new("UIStroke")
+Instance.new("UICorner", TogglePill).CornerRadius = UDim.new(0, 8)
+local pillStroke = Instance.new("UIStroke", TogglePill)
 pillStroke.Color = Palette.White
 pillStroke.Thickness = 1.2
-pillStroke.Parent = TogglePill
-
 makeDraggable(TogglePill, TogglePill)
 
--- Основное окно Ocel-hub
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.Size = UDim2.fromOffset(252, 314)
@@ -442,16 +461,11 @@ MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
 MainFrame.Parent = ScreenGui
 
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 10)
-mainCorner.Parent = MainFrame
-
-local mainStroke = Instance.new("UIStroke")
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+local mainStroke = Instance.new("UIStroke", MainFrame)
 mainStroke.Color = Palette.Stroke
 mainStroke.Thickness = 1.2
-mainStroke.Parent = MainFrame
 
--- Хедер
 local Header = Instance.new("Frame")
 Header.Size = UDim2.new(1, 0, 0, 38)
 Header.BackgroundTransparency = 1
@@ -496,7 +510,6 @@ Divider.BackgroundColor3 = Palette.Stroke
 Divider.BorderSizePixel = 0
 Divider.Parent = MainFrame
 
--- Табы
 local TabBar = Instance.new("Frame")
 TabBar.Size = UDim2.new(1, -24, 0, 28)
 TabBar.Position = UDim2.new(0, 12, 0, 46)
@@ -561,7 +574,6 @@ TabESPBtn.MouseButton1Click:Connect(function() setActiveTab("ESP") end)
 TabAIMBtn.MouseButton1Click:Connect(function() setActiveTab("AIM") end)
 setActiveTab("ESP")
 
--- Конструкторы контролов
 local function addToggle(parent, labelText, configKey)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 34)
@@ -571,10 +583,9 @@ local function addToggle(parent, labelText, configKey)
     btn.Parent = parent
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
 
-    local stroke = Instance.new("UIStroke")
+    local stroke = Instance.new("UIStroke", btn)
     stroke.Color = Palette.Stroke
     stroke.Thickness = 1
-    stroke.Parent = btn
 
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(1, -56, 1, 0)
@@ -633,10 +644,9 @@ local function addCycle(parent, labelText, configKey, options)
     btn.Parent = parent
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
 
-    local stroke = Instance.new("UIStroke")
+    local stroke = Instance.new("UIStroke", btn)
     stroke.Color = Palette.Stroke
     stroke.Thickness = 1
-    stroke.Parent = btn
 
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.55, 0, 1, 0)
@@ -676,10 +686,9 @@ local function addSlider(parent, labelText, configKey, minVal, maxVal, decimals)
     box.Parent = parent
     Instance.new("UICorner", box).CornerRadius = UDim.new(0, 7)
 
-    local stroke = Instance.new("UIStroke")
+    local stroke = Instance.new("UIStroke", box)
     stroke.Color = Palette.Stroke
     stroke.Thickness = 1
-    stroke.Parent = box
 
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.6, 0, 0, 22)
@@ -760,7 +769,6 @@ local function addSlider(parent, labelText, configKey, minVal, maxVal, decimals)
     updateFromRatio((Config[configKey] - minVal) / (maxVal - minVal))
 end
 
--- Наполнение вкладок
 addToggle(PageESP, "Boxes", "BoxESP")
 addToggle(PageESP, "Skeleton", "SkeletonESP")
 addToggle(PageESP, "Visible Highlight", "ESPVisibleColor")
@@ -794,7 +802,60 @@ UserInputService.InputBegan:Connect(function(input, gp)
 end)
 
 -- =========================================================================
--- Основной цикл ESP + Aimbot
+-- Поиск цели и поворот камеры (до cameraRenderUpdate и camShake)
+-- =========================================================================
+local function findBestTarget(screenCenter)
+    local bestPart = nil
+    local bestDist = Config.AimFOV
+
+    for player in pairs(ESPCache) do
+        local char = player.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if char and hum and hum.Health > 0 and root and isEnemy(player) then
+            local aimPart = char:FindFirstChild(Config.TargetPart)
+                or char:FindFirstChild("Torso")
+                or char:FindFirstChild("Head")
+                or root
+            if aimPart then
+                local pos, onScreen = Camera:WorldToViewportPoint(aimPart.Position)
+                if onScreen and pos.Z > 0 then
+                    local dist = (Vector2.new(pos.X, pos.Y) - screenCenter).Magnitude
+                    if dist < bestDist and (not Config.VisibleCheck or isVisible(char, aimPart)) then
+                        bestDist = dist
+                        bestPart = aimPart
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPart
+end
+
+local currentTargetPart = nil
+
+RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, function()
+    Camera = workspace.CurrentCamera
+    if not Camera then return end
+
+    local vpSize = Camera.ViewportSize
+    local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+
+    if Config.Aimbot or Config.LineToTarget then
+        currentTargetPart = findBestTarget(screenCenter)
+    else
+        currentTargetPart = nil
+    end
+
+    if Config.Aimbot and currentTargetPart and Camera.CameraType ~= Enum.CameraType.Scriptable then
+        local targetCF = CFrame.lookAt(Camera.CFrame.Position, currentTargetPart.Position)
+        Camera.CFrame = Camera.CFrame:Lerp(targetCF, Config.Smoothness)
+    end
+end)
+
+-- =========================================================================
+-- Отрисовка ESP, FOV и Line to Target после финального обновления камеры
 -- =========================================================================
 RunService.RenderStepped:Connect(function()
     Camera = workspace.CurrentCamera
@@ -803,7 +864,6 @@ RunService.RenderStepped:Connect(function()
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
 
-    -- FOV круг
     local showFov = Config.ShowFOV and (Config.Aimbot or Config.LineToTarget)
     FOVCircleOutline.Visible = showFov
     FOVCircle.Visible = showFov
@@ -813,10 +873,6 @@ RunService.RenderStepped:Connect(function()
         FOVCircle.Position = screenCenter
         FOVCircle.Radius = Config.AimFOV
     end
-
-    local bestTargetPart = nil
-    local bestScreenPos = nil
-    local bestDist = Config.AimFOV
 
     for player, data in pairs(ESPCache) do
         local char = player.Character
@@ -836,22 +892,6 @@ RunService.RenderStepped:Connect(function()
         local visible = isVisible(char, aimPart)
         local drawColor = (Config.ESPVisibleColor and not visible) and Palette.Dim or Palette.White
 
-        -- Поиск цели для Aimbot / Line to Target
-        if aimPart then
-            local pos, onScreen = Camera:WorldToViewportPoint(aimPart.Position)
-            if onScreen and pos.Z > 0 then
-                local distFromCenter = (Vector2.new(pos.X, pos.Y) - screenCenter).Magnitude
-                if distFromCenter < bestDist then
-                    if not Config.VisibleCheck or visible then
-                        bestDist = distFromCenter
-                        bestTargetPart = aimPart
-                        bestScreenPos = Vector2.new(pos.X, pos.Y)
-                    end
-                end
-            end
-        end
-
-        -- 2D Box ESP
         if Config.BoxESP then
             local bx, by, bw, bh = computeCharacterBox(char)
             if bx and bw > 2 and bh > 2 then
@@ -874,7 +914,6 @@ RunService.RenderStepped:Connect(function()
             data.Box.Visible = false
         end
 
-        -- Проработанный Skeleton ESP
         if Config.SkeletonESP then
             local segs = getSkeletonSegments(char)
             local used = 0
@@ -904,7 +943,6 @@ RunService.RenderStepped:Connect(function()
                 data.Bones[i].Visible = false
             end
 
-            -- Кружок головы масштабируется по дистанции
             local head = char:FindFirstChild("Head")
             if head then
                 local hp, onH = Camera:WorldToViewportPoint(head.Position)
@@ -935,24 +973,20 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
-    -- Line to Target + Aimbot
-    if bestTargetPart and bestScreenPos then
-        if Config.LineToTarget then
+    if Config.LineToTarget and currentTargetPart and currentTargetPart.Parent then
+        local pos, onScreen = Camera:WorldToViewportPoint(currentTargetPart.Position)
+        if onScreen and pos.Z > 0 then
+            local targetPos2D = Vector2.new(pos.X, pos.Y)
             TargetLineOutline.From = screenCenter
-            TargetLineOutline.To = bestScreenPos
+            TargetLineOutline.To = targetPos2D
             TargetLineOutline.Visible = true
 
             TargetLine.From = screenCenter
-            TargetLine.To = bestScreenPos
+            TargetLine.To = targetPos2D
             TargetLine.Visible = true
         else
             TargetLineOutline.Visible = false
             TargetLine.Visible = false
-        end
-
-        if Config.Aimbot then
-            local targetCF = CFrame.lookAt(Camera.CFrame.Position, bestTargetPart.Position)
-            Camera.CFrame = Camera.CFrame:Lerp(targetCF, Config.Smoothness)
         end
     else
         TargetLineOutline.Visible = false
