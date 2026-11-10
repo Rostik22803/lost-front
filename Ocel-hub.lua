@@ -1,25 +1,30 @@
 -- language: Luau, file: Ocel-hub.lua, runtime: Roblox Mobile / PC Executors
--- *Аимбот привязан к Enum.RenderPriority.Camera.Value - 1 (до camShake/ResetCF)*
+-- *AimSpeed нормализован по dt (1.0 = мгновенный лок), добавлен ESP на FPV-дроны*
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 
--- Очистка предыдущего инстанса и бинда при повторном запуске
+-- Полная очистка предыдущего запуска (UI, бинды, Drawing)
+if _G.OcelHubCleanup then
+    pcall(_G.OcelHubCleanup)
+end
 pcall(function() RunService:UnbindFromRenderStep("OcelAimbot") end)
+
 local uiParent = (gethui and gethui()) or CoreGui
 pcall(function()
     local old = uiParent:FindFirstChild("OcelHub_UI")
     if old then old:Destroy() end
 end)
 
--- Клиентский реестр команд Lost Front (fallback помимо PlayerGui/teamHighlight)
+-- Клиентский реестр команд Lost Front
 local LostFrontRegistry = nil
 pcall(function()
     local loaderMod = ReplicatedStorage:FindFirstChild("lIIIlIIllIIlllIIIlllllIIlIIIIIlllIIIlIlllIllllIlIIIllIlIIIIl")
@@ -36,6 +41,7 @@ local Config = {
     -- ESP
     BoxESP = true,
     SkeletonESP = true,
+    FPVESP = true,
     ESPVisibleColor = true,
     TeamCheck = true,
     -- Aimbot
@@ -45,7 +51,7 @@ local Config = {
     ShowFOV = true,
     TargetPart = "Head", -- "Head" | "UpperTorso"
     AimFOV = 120,
-    Smoothness = 0.25,
+    AimSpeed = 0.85,
 }
 
 local Palette = {
@@ -57,6 +63,8 @@ local Palette = {
     Dim = Color3.fromRGB(95, 95, 95),
     Black = Color3.fromRGB(0, 0, 0),
 }
+
+local Connections = {}
 
 local function newLine(thickness, color, zIndex)
     local line = Drawing.new("Line")
@@ -91,12 +99,26 @@ local function newCircle(thickness, color, numSides, zIndex)
     return c
 end
 
+local function newText(size, color, zIndex)
+    local t = Drawing.new("Text")
+    t.Visible = false
+    t.Size = size or 13
+    t.Color = color or Palette.White
+    t.Center = true
+    t.Outline = true
+    t.OutlineColor = Palette.Black
+    t.Font = 2
+    t.Transparency = 1
+    t.ZIndex = zIndex or 3
+    return t
+end
+
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 
-local function isVisible(targetChar, targetPart)
-    if not targetChar or not targetPart or not Camera then return false end
+local function isVisible(targetModel, targetPart)
+    if not targetModel or not targetPart or not Camera then return false end
     local origin = Camera.CFrame.Position
     local targetPos = targetPart.Position
     local ignoreList = {}
@@ -113,7 +135,7 @@ local function isVisible(targetChar, targetPart)
             return true
         end
         local hit = result.Instance
-        if hit:IsDescendantOf(targetChar) then
+        if hit:IsDescendantOf(targetModel) then
             return true
         end
         if (not hit.CanCollide) or hit.Transparency >= 0.85 then
@@ -302,13 +324,13 @@ local bodyPartsSet = {
     RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
 }
 
-local function computeCharacterBox(char)
+local function computeBoxFromParts(model, filterSet)
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyVisible = false
 
-    for _, part in ipairs(char:GetChildren()) do
-        if part:IsA("BasePart") and bodyPartsSet[part.Name] then
+    for _, part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") and (not filterSet or filterSet[part.Name]) then
             local cf = part.CFrame
             local half = part.Size * 0.5
             for sx = -1, 1, 2 do
@@ -335,6 +357,7 @@ local function computeCharacterBox(char)
     return minX, minY, maxX - minX, maxY - minY
 end
 
+-- Кэш ESP игроков
 local MAX_BONES = 18
 local ESPCache = {}
 
@@ -383,8 +406,50 @@ end
 for _, p in ipairs(Players:GetPlayers()) do
     if p ~= LocalPlayer then createPlayerESP(p) end
 end
-Players.PlayerAdded:Connect(createPlayerESP)
-Players.PlayerRemoving:Connect(removePlayerESP)
+table.insert(Connections, Players.PlayerAdded:Connect(createPlayerESP))
+table.insert(Connections, Players.PlayerRemoving:Connect(removePlayerESP))
+
+-- Кэш ESP FPV-дронов (Lost Front: тег "drone" и папка IllllII_iiii)
+local DroneCache = {}
+
+local function trackDrone(drone)
+    if DroneCache[drone] or not drone:IsA("Model") then return end
+    DroneCache[drone] = {
+        BoxOutline = newSquare(3, Palette.Black, 1),
+        Box = newSquare(1.4, Palette.White, 2),
+        Label = newText(13, Palette.White, 3),
+    }
+end
+
+local function hideDroneESP(data)
+    data.BoxOutline.Visible = false
+    data.Box.Visible = false
+    data.Label.Visible = false
+end
+
+local function untrackDrone(drone)
+    local data = DroneCache[drone]
+    if not data then return end
+    data.BoxOutline:Remove()
+    data.Box:Remove()
+    data.Label:Remove()
+    DroneCache[drone] = nil
+end
+
+for _, inst in ipairs(CollectionService:GetTagged("drone")) do
+    trackDrone(inst)
+end
+local droneFolder = workspace:FindFirstChild("IllllII_iiii")
+if droneFolder then
+    for _, inst in ipairs(droneFolder:GetDescendants()) do
+        if inst:HasTag("drone") then trackDrone(inst) end
+    end
+    table.insert(Connections, droneFolder.DescendantAdded:Connect(function(inst)
+        if inst:HasTag("drone") then trackDrone(inst) end
+    end))
+end
+table.insert(Connections, CollectionService:GetInstanceAddedSignal("drone"):Connect(trackDrone))
+table.insert(Connections, CollectionService:GetInstanceRemovedSignal("drone"):Connect(untrackDrone))
 
 local FOVCircleOutline = newCircle(2.5, Palette.Black, 64, 3)
 local FOVCircle = newCircle(1.2, Palette.White, 64, 4)
@@ -416,7 +481,7 @@ local function makeDraggable(dragHandle, moveTarget)
         end
     end)
 
-    UserInputService.InputChanged:Connect(function(input)
+    table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
         if not dragging or isDraggingSlider then return end
         if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
             local delta = input.Position - dragStart
@@ -425,13 +490,13 @@ local function makeDraggable(dragHandle, moveTarget)
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
         end
-    end)
+    end))
 
-    UserInputService.InputEnded:Connect(function(input)
+    table.insert(Connections, UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
-    end)
+    end))
 end
 
 local TogglePill = Instance.new("TextButton")
@@ -454,8 +519,8 @@ makeDraggable(TogglePill, TogglePill)
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.fromOffset(252, 314)
-MainFrame.Position = UDim2.new(0.5, -126, 0.5, -157)
+MainFrame.Size = UDim2.fromOffset(252, 324)
+MainFrame.Position = UDim2.new(0.5, -126, 0.5, -162)
 MainFrame.BackgroundColor3 = Palette.Bg
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
@@ -753,24 +818,25 @@ local function addSlider(parent, labelText, configKey, minVal, maxVal, decimals)
         end
     end)
 
-    UserInputService.InputChanged:Connect(function(input)
+    table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
         if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             updateFromInput(input.Position.X)
         end
-    end)
+    end))
 
-    UserInputService.InputEnded:Connect(function(input)
+    table.insert(Connections, UserInputService.InputEnded:Connect(function(input)
         if sliding and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             sliding = false
             isDraggingSlider = false
         end
-    end)
+    end))
 
     updateFromRatio((Config[configKey] - minVal) / (maxVal - minVal))
 end
 
 addToggle(PageESP, "Boxes", "BoxESP")
 addToggle(PageESP, "Skeleton", "SkeletonESP")
+addToggle(PageESP, "FPV Drones", "FPVESP")
 addToggle(PageESP, "Visible Highlight", "ESPVisibleColor")
 addToggle(PageESP, "Team Check", "TeamCheck")
 
@@ -780,7 +846,7 @@ addToggle(PageAIM, "Line to Target", "LineToTarget")
 addToggle(PageAIM, "Show FOV", "ShowFOV")
 addCycle(PageAIM, "Target Part", "TargetPart", { "Head", "UpperTorso" })
 addSlider(PageAIM, "Aim FOV", "AimFOV", 30, 300, 0)
-addSlider(PageAIM, "Smoothness", "Smoothness", 0.05, 1.0, 2)
+addSlider(PageAIM, "Aim Speed", "AimSpeed", 0.15, 1.00, 2)
 
 local function setMenuVisible(state)
     Config.MenuOpen = state
@@ -795,14 +861,14 @@ CloseBtn.MouseButton1Click:Connect(function()
     setMenuVisible(false)
 end)
 
-UserInputService.InputBegan:Connect(function(input, gp)
+table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gp)
     if not gp and input.KeyCode == Enum.KeyCode.RightShift then
         setMenuVisible(not Config.MenuOpen)
     end
-end)
+end))
 
 -- =========================================================================
--- Поиск цели и поворот камеры (до cameraRenderUpdate и camShake)
+-- Поиск цели и наводка (до cameraRenderUpdate и camShake)
 -- =========================================================================
 local function findBestTarget(screenCenter)
     local bestPart = nil
@@ -835,7 +901,7 @@ end
 
 local currentTargetPart = nil
 
-RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, function()
+RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, function(dt)
     Camera = workspace.CurrentCamera
     if not Camera then return end
 
@@ -850,19 +916,25 @@ RunService:BindToRenderStep("OcelAimbot", Enum.RenderPriority.Camera.Value - 1, 
 
     if Config.Aimbot and currentTargetPart and Camera.CameraType ~= Enum.CameraType.Scriptable then
         local targetCF = CFrame.lookAt(Camera.CFrame.Position, currentTargetPart.Position)
-        Camera.CFrame = Camera.CFrame:Lerp(targetCF, Config.Smoothness)
+        if Config.AimSpeed >= 0.98 then
+            Camera.CFrame = targetCF
+        else
+            local alpha = math.clamp(1 - (1 - Config.AimSpeed) ^ (math.max(dt, 1 / 240) * 60), 0, 1)
+            Camera.CFrame = Camera.CFrame:Lerp(targetCF, alpha)
+        end
     end
 end)
 
 -- =========================================================================
--- Отрисовка ESP, FOV и Line to Target после финального обновления камеры
+-- Отрисовка ESP игроков, FPV-дронов, FOV и Line to Target
 -- =========================================================================
-RunService.RenderStepped:Connect(function()
+table.insert(Connections, RunService.RenderStepped:Connect(function()
     Camera = workspace.CurrentCamera
     if not Camera then return end
 
     local vpSize = Camera.ViewportSize
     local screenCenter = Vector2.new(vpSize.X * 0.5, vpSize.Y * 0.5)
+    local camPos = Camera.CFrame.Position
 
     local showFov = Config.ShowFOV and (Config.Aimbot or Config.LineToTarget)
     FOVCircleOutline.Visible = showFov
@@ -874,6 +946,7 @@ RunService.RenderStepped:Connect(function()
         FOVCircle.Radius = Config.AimFOV
     end
 
+    -- Игроки
     for player, data in pairs(ESPCache) do
         local char = player.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -893,7 +966,7 @@ RunService.RenderStepped:Connect(function()
         local drawColor = (Config.ESPVisibleColor and not visible) and Palette.Dim or Palette.White
 
         if Config.BoxESP then
-            local bx, by, bw, bh = computeCharacterBox(char)
+            local bx, by, bw, bh = computeBoxFromParts(char, bodyPartsSet)
             if bx and bw > 2 and bh > 2 then
                 local boxPos = Vector2.new(bx, by)
                 local boxSize = Vector2.new(bw, bh)
@@ -973,6 +1046,72 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
+    -- FPV-дроны
+    for drone, data in pairs(DroneCache) do
+        if not Config.FPVESP or not drone.Parent or not drone:IsDescendantOf(workspace) then
+            hideDroneESP(data)
+            continue
+        end
+
+        local ownerName = drone:GetAttribute("player")
+        local owner = ownerName and Players:FindFirstChild(ownerName)
+        if owner == LocalPlayer or (Config.TeamCheck and owner and not isEnemy(owner)) then
+            hideDroneESP(data)
+            continue
+        end
+
+        local refPart = drone.PrimaryPart or drone:FindFirstChildWhichIsA("BasePart", true)
+        if not refPart then
+            hideDroneESP(data)
+            continue
+        end
+
+        local centerPos, onScreen = Camera:WorldToViewportPoint(refPart.Position)
+        if not onScreen or centerPos.Z <= 0 then
+            hideDroneESP(data)
+            continue
+        end
+
+        local bx, by, bw, bh = computeBoxFromParts(drone, nil)
+        if not bx then
+            bx = centerPos.X - 8
+            by = centerPos.Y - 8
+            bw = 16
+            bh = 16
+        else
+            local minSize = 14
+            if bw < minSize then
+                bx = bx - (minSize - bw) * 0.5
+                bw = minSize
+            end
+            if bh < minSize then
+                by = by - (minSize - bh) * 0.5
+                bh = minSize
+            end
+        end
+
+        local visible = isVisible(drone, refPart)
+        local drawColor = (Config.ESPVisibleColor and not visible) and Palette.Dim or Palette.White
+        local distMeters = math.floor((refPart.Position - camPos).Magnitude * 0.28 + 0.5)
+
+        local boxPos = Vector2.new(bx, by)
+        local boxSize = Vector2.new(bw, bh)
+        data.BoxOutline.Position = boxPos
+        data.BoxOutline.Size = boxSize
+        data.BoxOutline.Visible = true
+
+        data.Box.Position = boxPos
+        data.Box.Size = boxSize
+        data.Box.Color = drawColor
+        data.Box.Visible = true
+
+        data.Label.Text = string.format("[FPV] %dm", distMeters)
+        data.Label.Position = Vector2.new(bx + bw * 0.5, by - 16)
+        data.Label.Color = drawColor
+        data.Label.Visible = true
+    end
+
+    -- Line to Target
     if Config.LineToTarget and currentTargetPart and currentTargetPart.Parent then
         local pos, onScreen = Camera:WorldToViewportPoint(currentTargetPart.Position)
         if onScreen and pos.Z > 0 then
@@ -992,4 +1131,18 @@ RunService.RenderStepped:Connect(function()
         TargetLineOutline.Visible = false
         TargetLine.Visible = false
     end
-end)
+end))
+
+_G.OcelHubCleanup = function()
+    pcall(function() RunService:UnbindFromRenderStep("OcelAimbot") end)
+    for _, conn in ipairs(Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    for p in pairs(ESPCache) do removePlayerESP(p) end
+    for d in pairs(DroneCache) do untrackDrone(d) end
+    pcall(function() FOVCircleOutline:Remove() end)
+    pcall(function() FOVCircle:Remove() end)
+    pcall(function() TargetLineOutline:Remove() end)
+    pcall(function() TargetLine:Remove() end)
+    pcall(function() ScreenGui:Destroy() end)
+end
